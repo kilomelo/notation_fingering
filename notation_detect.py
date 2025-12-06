@@ -14,6 +14,63 @@ def log(level: int, msg: str) -> None:
         print(msg)
 
 
+# 简单的大小调调号集合（主音 + 升降号），用于合法性校验与音高拼写
+KEY_SCALES = {
+    "C":  ["C", "D", "E", "F", "G", "A", "B"],
+    "G":  ["G", "A", "B", "C", "D", "E", "F#"],
+    "D":  ["D", "E", "F#", "G", "A", "B", "C#"],
+    "A":  ["A", "B", "C#", "D", "E", "F#", "G#"],
+    "E":  ["E", "F#", "G#", "A", "B", "C#", "D#"],
+    "B":  ["B", "C#", "D#", "E", "F#", "G#", "A#"],
+    "F#": ["F#", "G#", "A#", "B", "C#", "D#", "E#"],
+    "C#": ["C#", "D#", "E#", "F#", "G#", "A#", "B#"],
+    "F":  ["F", "G", "A", "Bb", "C", "D", "E"],
+    "Bb": ["Bb", "C", "D", "Eb", "F", "G", "A"],
+    "Eb": ["Eb", "F", "G", "Ab", "Bb", "C", "D"],
+    "Ab": ["Ab", "Bb", "C", "Db", "Eb", "F", "G"],
+    "Db": ["Db", "Eb", "F", "Gb", "Ab", "Bb", "C"],
+    "Gb": ["Gb", "Ab", "Bb", "Cb", "Db", "Eb", "F"],
+    "Cb": ["Cb", "Db", "Eb", "Fb", "Gb", "Ab", "Bb"],
+}
+
+
+def normalize_key(key: str) -> str:
+    """校验并规范调号，不合法则返回 'C' 并输出 warning。"""
+    if not isinstance(key, str):
+        log(0, "Warning: key must be string, fallback to 'C'")
+        return "C"
+    k = key.strip()
+    if len(k) == 0 or len(k) > 2:
+        log(0, f"Warning: invalid key '{key}', fallback to 'C'")
+        return "C"
+    if len(k) == 1:
+        if k in KEY_SCALES:
+            return k
+        log(0, f"Warning: invalid key '{key}', fallback to 'C'")
+        return "C"
+    # len == 2
+    base, accidental = k[0], k[1]
+    if base not in "CDEFGAB" or accidental not in "#b":
+        log(0, f"Warning: invalid key '{key}', fallback to 'C'")
+        return "C"
+    if k in KEY_SCALES:
+        return k
+    log(0, f"Warning: unsupported key '{key}', fallback to 'C'")
+    return "C"
+
+
+def degree_to_pitch(key: str, degree: int, octave_offset: int) -> str:
+    """按调号和八度偏移计算音高字符串（基准八度 3）。"""
+    if degree <= 0:
+        return "Rest"
+    key_norm = normalize_key(key)
+    scale = KEY_SCALES[key_norm]
+    idx = (degree - 1) % 7
+    note_name = scale[idx]
+    base_octave = 3  # 1度所在的基准八度
+    octave = base_octave + octave_offset
+    return f"{note_name}{octave}"
+
 @dataclass
 class DetectParams:
     """集中配置识别阈值/系数，方便统一调整。"""
@@ -47,15 +104,29 @@ class Note:
     h: int               # 数字框高
     dots: List[tuple] = field(default_factory=list)  # 记录检测到的点的中心坐标列表
     search_regions: List[tuple] = field(default_factory=list)  # 点搜索区域 (x1,y1,x2,y2)
+    pitch: str = ""      # 计算得到的音高字符串（如 C4、F#4 等）
 
     def center(self):
         return (self.x + self.w // 2, self.y + self.h // 2)
 
 
-def extract_notes(image_path: str, params: Optional[DetectParams] = None):
-    """从单行简谱图片中提取音符列表（最小可用实现）"""
+def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: str = "C"):
+    """
+    从单行简谱图片中提取音符列表。
+
+    参数：
+        image_path: 输入图片路径。
+        params: DetectParams，可选，集中配置各类阈值；不传则用默认。
+        key: 调号字符串，形如 "C", "G", "Bb", "F#", 默认 "C"。首字符必须是 A-G 之一，可选第二字符为 # 或 b。
+
+    返回：
+        notes: List[Note]，按 x 从左到右排序，包含 pitch、八度偏移、点等信息。
+        row_center_y: 主行中心 y，用于调试行绘制。
+        raw_boxes: 原始连通域列表 (id, x, y, w, h)，用于调试。
+    """
     if params is None:
         params = DetectParams()
+    key_norm = normalize_key(key)
 
     # 1. 读图
     img_bgr = cv2.imread(image_path)
@@ -281,10 +352,13 @@ def extract_notes(image_path: str, params: Optional[DetectParams] = None):
                 num_dots_below += 1
                 dots.append((int(cx_box), int(by + bh / 2.0)))
 
-        # 为了简单：如果检测到很多点，就裁剪到 [-2, 2] 范围内
-        octave_offset = max(-2, min(2, num_dots_above - num_dots_below))
         if num_dots_above > 0 and num_dots_below > 0:
             log(0, f"Warning: both upper and lower dots detected at digit x={x}, y={y}")
+            num_dots_above = 0  # 规则：上点数置 0 再计算
+
+        # 为了简单：如果检测到很多点，就裁剪到 [-2, 2] 范围内
+        octave_offset = max(-2, min(2, num_dots_above - num_dots_below))
+        pitch = degree_to_pitch(key_norm, degree, octave_offset)
 
         note = Note(
             degree=degree,
@@ -295,6 +369,7 @@ def extract_notes(image_path: str, params: Optional[DetectParams] = None):
             h=h,
             dots=dots,
             search_regions=search_regions,
+            pitch=pitch,
         )
         notes.append(note)
 
@@ -378,7 +453,8 @@ def draw_notes_on_image(
 
 def main():
     # 示例：你可以改成从命令行参数读取
-    image_path = "jianpu4.png"  # 替换成你的简谱图片路径
+    image_path = "jianpu5.png"  # 替换成你的简谱图片路径
+    key = "G"                   # 调号，形如 C, G, Bb, F# 等
     params = DetectParams(
         upscale=1.0,                 # 全图 OCR 前的放大倍率（保留入口，当前未使用额外放大）
         area_min_factor=0.2,         # 连通域面积下限（相对中位数），过小判噪声
@@ -395,7 +471,7 @@ def main():
         max_dot_size_factor=0.25,    # 认定为点的最大宽/高（相对数字高度）
         cx_tol_factor=0.2,           # 点中心与数字中心的水平容差（相对数字高度）
     )
-    notes, row_center_y, raw_boxes = extract_notes(image_path, params=params)
+    notes, row_center_y, raw_boxes = extract_notes(image_path, params=params, key=key)
 
     print(f"Detected {len(notes)} notes:")
     for i, n in enumerate(notes, 1):
@@ -404,7 +480,8 @@ def main():
             f"{i:2d}. degree={n.degree}, "
             f"octave_offset={n.octave_offset:+d}, "
             f"bbox=({n.x},{n.y},{n.w},{n.h}), "
-            f"center=({cx},{cy})"
+            f"center=({cx},{cy}), "
+            f"pitch={n.pitch}"
         )
 
     if notes:
