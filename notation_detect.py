@@ -6,7 +6,7 @@ from PIL import Image
 import pytesseract
 
 # 调试信息输出等级（越大越多），默认 1；打印时用 log(level, msg)
-INFO_LEVEL = 1
+INFO_LEVEL = 2
 
 
 def log(level: int, msg: str) -> None:
@@ -88,6 +88,7 @@ class DetectParams:
     search_height_factor: float = 0.9     # 点搜索区高度（相对数字高）
     max_dot_size_factor: float = 1 / 3    # 点尺寸上限（相对数字高）
     cx_tol_factor: float = 0.25           # 点中心与数字中心的水平容差（相对数字高）
+    slur_ratio: float = 2.0               # 判定为连音线的宽高比阈值（w >= h * slur_ratio）
 
 # 如果 Tesseract 不在 PATH，需要手动指定安装路径，例如：
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -105,6 +106,9 @@ class Note:
     dots: List[tuple] = field(default_factory=list)  # 记录检测到的点的中心坐标列表
     search_regions: List[tuple] = field(default_factory=list)  # 点搜索区域 (x1,y1,x2,y2)
     pitch: str = ""      # 计算得到的音高字符串（如 C4、F#4 等）
+    slur_start_ids: List[int] = field(default_factory=list)  # 以该音为起点的连音线 id
+    slur_end_ids: List[int] = field(default_factory=list)    # 以该音为终点的连音线 id
+    articulation: bool = True  # True 表示音头，False 表示延音
 
     def center(self):
         return (self.x + self.w // 2, self.y + self.h // 2)
@@ -149,6 +153,7 @@ def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: s
 
     candidates = []
     raw_boxes = []
+    slur_boxes = []
     areas = []
     for idx, cnt in enumerate(contours, 1):
         x, y, w, h = cv2.boundingRect(cnt)
@@ -211,11 +216,15 @@ def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: s
             log(2, "OCR fallback (dilate) succeeded")
         return txt
 
-    # 粗过滤极端尺寸的候选框
+    # 粗过滤极端尺寸的候选框，同时识别可能的连音线
     size_filtered = []
     for cand in candidates:
         x, y, w, h = cand["x"], cand["y"], cand["w"], cand["h"]
         area = w * h
+        ratio = w / h if h else float("inf")
+        if ratio >= params.slur_ratio:
+            slur_boxes.append({"id": cand["id"], "x": x, "y": y, "w": w, "h": h})
+            continue
         if area < median_area * params.area_min_factor:
             log(2, f"Skip cand#{cand['id']} area too small ({area})")
             continue
@@ -308,8 +317,10 @@ def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: s
         # 上方搜索区域
         above_y2 = max(0, y - margin_y)
         above_y1 = max(0, above_y2 - search_height)
+        above_region = None
         if above_y2 > above_y1:
             search_regions.append((x1, above_y1, x2, above_y2))
+            above_region = (x1, above_y1, x2, above_y2)
 
         # 下方搜索区域
         below_y1 = min(h_img, y + h + margin_y)
@@ -325,6 +336,9 @@ def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: s
 
         def box_inside_region(bx, by, bw, bh, rx1, ry1, rx2, ry2) -> bool:
             return bx >= rx1 and by >= ry1 and (bx + bw) <= rx2 and (by + bh) <= ry2
+        def point_in_region(px, py, region) -> bool:
+            x1r, y1r, x2r, y2r = region
+            return x1r <= px <= x2r and y1r <= py <= y2r
 
         # ---- 搜索上方的点 ----
         if above_y2 > above_y1:
@@ -360,6 +374,18 @@ def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: s
         octave_offset = max(-2, min(2, num_dots_above - num_dots_below))
         pitch = degree_to_pitch(key_norm, degree, octave_offset)
 
+        slur_starts = []
+        slur_ends = []
+        if above_region and slur_boxes:
+            for slur in slur_boxes:
+                sx, sy, sw, sh = slur["x"], slur["y"], slur["w"], slur["h"]
+                left_bottom = (sx, sy + sh)
+                right_bottom = (sx + sw, sy + sh)
+                if point_in_region(*left_bottom, above_region):
+                    slur_starts.append(slur["id"])
+                if point_in_region(*right_bottom, above_region):
+                    slur_ends.append(slur["id"])
+
         note = Note(
             degree=degree,
             octave_offset=octave_offset,
@@ -370,11 +396,22 @@ def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: s
             dots=dots,
             search_regions=search_regions,
             pitch=pitch,
+            slur_start_ids=slur_starts,
+            slur_end_ids=slur_ends,
         )
         notes.append(note)
 
     # 5. 从左到右排序（单行简谱）
     notes.sort(key=lambda n: n.x)
+
+    # 6. articulation：若上一音 pitch 相同且共享同一条连音线（前音为起点，当前为终点），则当前不是音头
+    for i, note in enumerate(notes):
+        if i == 0:
+            note.articulation = True
+            continue
+        prev = notes[i - 1]
+        shared_slur = set(prev.slur_start_ids) & set(note.slur_end_ids)
+        note.articulation = not (note.pitch == prev.pitch and len(shared_slur) > 0)
 
     return notes, row_center_y, raw_boxes
 
@@ -433,7 +470,8 @@ def draw_notes_on_image(
                 cv2.rectangle(img, (sx1, sy1), (sx2, sy2), color, 1)
             pt1 = (note.x, note.y)
             pt2 = (note.x + note.w, note.y + note.h)
-            cv2.rectangle(img, pt1, pt2, color, 1)  # 线宽减半
+            thickness = 2 if note.articulation else 1
+            cv2.rectangle(img, pt1, pt2, color, thickness)
             for dot in note.dots:
                 cv2.circle(img, dot, radius=3, color=color, thickness=-1)
         return img
@@ -453,7 +491,7 @@ def draw_notes_on_image(
 
 def main():
     # 示例：你可以改成从命令行参数读取
-    image_path = "jianpu5.png"  # 替换成你的简谱图片路径
+    image_path = "pu6.png"  # 替换成你的简谱图片路径
     key = "G"                   # 调号，形如 C, G, Bb, F# 等
     params = DetectParams(
         upscale=1.0,                 # 全图 OCR 前的放大倍率（保留入口，当前未使用额外放大）
@@ -462,13 +500,13 @@ def main():
         width_height_ratio_max=1.0,  # 连通域过宽剔除阈值：w > h * ratio 认为是连线/括号
         height_ratio_max=2.0,        # 连通域过高剔除阈值：h > median_h_all * ratio 认为是小节线
         row_tolerance_factor=0.6,    # 行聚类 y 容差（系数 * 数字中位高）
-        pad_ratio=0.12,              # OCR 时为候选框添加的 padding（相对 max(w,h)）
+        pad_ratio=0.15,              # OCR 时为候选框添加的 padding（相对 max(w,h)）
         ocr_scale=3.0,               # 单字符 OCR 放大倍率
         ocr_dilate_kernel=2,         # OCR fallback 时膨胀核尺寸（像素）
         search_width_factor=0.75,    # 点搜索区域宽度（相对数字高度）
-        margin_y_factor=0.1,         # 点搜索区域上下边距（相对数字高度）
+        margin_y_factor=0.01,         # 点搜索区域上下边距（相对数字高度）
         search_height_factor=1.25,   # 点搜索区域高度（相对数字高度）
-        max_dot_size_factor=0.25,    # 认定为点的最大宽/高（相对数字高度）
+        max_dot_size_factor=0.35,    # 认定为点的最大宽/高（相对数字高度）
         cx_tol_factor=0.2,           # 点中心与数字中心的水平容差（相对数字高度）
     )
     notes, row_center_y, raw_boxes = extract_notes(image_path, params=params, key=key)
@@ -481,7 +519,8 @@ def main():
             f"octave_offset={n.octave_offset:+d}, "
             f"bbox=({n.x},{n.y},{n.w},{n.h}), "
             f"center=({cx},{cy}), "
-            f"pitch={n.pitch}"
+            f"pitch={n.pitch}, "
+            f"articulation={'head' if n.articulation else 'tie'}"
         )
 
     if notes:
