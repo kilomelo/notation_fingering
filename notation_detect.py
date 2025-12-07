@@ -6,7 +6,7 @@ from PIL import Image
 import pytesseract
 
 # 调试信息输出等级（越大越多），默认 1；打印时用 log(level, msg)
-INFO_LEVEL = 2
+INFO_LEVEL = 1
 
 
 def log(level: int, msg: str) -> None:
@@ -80,14 +80,14 @@ class DetectParams:
     width_height_ratio_max: float = 1.0   # 候选过宽剔除阈值（w > h * ratio）
     height_ratio_max: float = 2.0         # 候选过高剔除阈值（h > median_h_all * ratio）
     row_tolerance_factor: float = 0.6     # 行聚类 y 容差系数（乘以数字中位高）
-    pad_ratio: float = 0.12               # OCR 裁剪时的边缘 padding（相对 max(w,h)）
+    pad_ratio: float = 0.15               # OCR 裁剪时的边缘 padding（相对 max(w,h)）
     ocr_scale: float = 3.0                # 单字符 OCR 的放大倍数
     ocr_dilate_kernel: int = 2            # fallback 膨胀核尺寸（正方形核边长）
-    search_width_factor: float = 0.6      # 点搜索区宽度系数（相对数字高）
-    margin_y_factor: float = 0.2          # 点搜索区上下边距（相对数字高）
-    search_height_factor: float = 0.9     # 点搜索区高度（相对数字高）
-    max_dot_size_factor: float = 1 / 3    # 点尺寸上限（相对数字高）
-    cx_tol_factor: float = 0.25           # 点中心与数字中心的水平容差（相对数字高）
+    search_width_factor: float = 0.75     # 点搜索区宽度系数（相对数字高）
+    margin_y_factor: float = 0.01         # 点搜索区上下边距（相对数字高）
+    search_height_factor: float = 1.25    # 点搜索区高度（相对数字高）
+    max_dot_size_factor: float = 0.35     # 点尺寸上限（相对数字高）
+    cx_tol_factor: float = 0.2            # 点中心与数字中心的水平容差（相对数字高）
     slur_ratio: float = 2.0               # 判定为连音线的宽高比阈值（w >= h * slur_ratio）
 
 # 如果 Tesseract 不在 PATH，需要手动指定安装路径，例如：
@@ -114,7 +114,16 @@ class Note:
         return (self.x + self.w // 2, self.y + self.h // 2)
 
 
-def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: str = "C"):
+@dataclass
+class DetectionResult:
+    """extract_notes 的输出容器"""
+    image_path: str
+    notes: List[Note]
+    row_center_y: Optional[int]
+    raw_boxes: List[tuple]
+
+
+def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: str = "C") -> DetectionResult:
     """
     从单行简谱图片中提取音符列表。
 
@@ -413,121 +422,9 @@ def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: s
         shared_slur = set(prev.slur_start_ids) & set(note.slur_end_ids)
         note.articulation = not (note.pitch == prev.pitch and len(shared_slur) > 0)
 
-    return notes, row_center_y, raw_boxes
-
-
-def draw_notes_on_image(
-    image_path: str,
-    notes: List[Note],
-    row_center_y: int = None,
-    raw_boxes: List[tuple] = None,
-    window_name: str = "Detected notes",
-) -> None:
-    """用矩形把检测结果画出来并显示原图。空格循环三个模式：原图、原始调试、最终结果调试。"""
-    base_img = cv2.imread(image_path)
-    if base_img is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
-
-    colors = [
-        (0, 0, 255),     # 红
-        (0, 165, 255),   # 橙
-        (255, 0, 0),     # 蓝
-        (0, 100, 0),     # 深绿
-        (255, 0, 255),   # 紫
-    ]
-
-    def render(mode: int) -> np.ndarray:
-        """
-        mode 0: 原图
-        mode 1: 原始调试（所有轮廓框）
-        mode 2: 最终结果调试（主行、音符框、点）
-        """
-        img = base_img.copy()
-        if mode == 0:
-            return img
-        if mode == 1:
-            if raw_boxes:
-                for orig_id, x, y, w, h in raw_boxes:
-                    color = colors[(orig_id - 1) % len(colors)]
-                    cv2.rectangle(img, (x, y), (x + w, y + h), color, 1)
-                    cv2.putText(
-                        img,
-                        str(orig_id),
-                        (x, max(10, y - 2)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        1,
-                        cv2.LINE_AA,
-                    )
-            return img
-        # mode == 2
-        if row_center_y is not None:
-            cv2.line(img, (0, row_center_y), (img.shape[1], row_center_y), (255, 0, 255), 1)  # 紫色线，线宽减半
-        for idx, note in enumerate(notes, 1):
-            color = colors[(idx - 1) % len(colors)]
-            for sx1, sy1, sx2, sy2 in note.search_regions:
-                cv2.rectangle(img, (sx1, sy1), (sx2, sy2), color, 1)
-            pt1 = (note.x, note.y)
-            pt2 = (note.x + note.w, note.y + note.h)
-            thickness = 2 if note.articulation else 1
-            cv2.rectangle(img, pt1, pt2, color, thickness)
-            for dot in note.dots:
-                cv2.circle(img, dot, radius=3, color=color, thickness=-1)
-        return img
-
-    mode = 2  # 默认显示最终调试
-    while True:
-        img_to_show = render(mode)
-        cv2.imshow(window_name, img_to_show)
-        key = cv2.waitKey(0) & 0xFF
-        if key == 32:  # 空格键切换模式
-            mode = (mode + 1) % 3
-            continue
-        else:
-            break
-    cv2.destroyAllWindows()
-
-
-def main():
-    # 示例：你可以改成从命令行参数读取
-    image_path = "pu6.png"  # 替换成你的简谱图片路径
-    key = "G"                   # 调号，形如 C, G, Bb, F# 等
-    params = DetectParams(
-        upscale=1.0,                 # 全图 OCR 前的放大倍率（保留入口，当前未使用额外放大）
-        area_min_factor=0.2,         # 连通域面积下限（相对中位数），过小判噪声
-        area_max_factor=4.5,         # 连通域面积上限（相对中位数），过大判非数字
-        width_height_ratio_max=1.0,  # 连通域过宽剔除阈值：w > h * ratio 认为是连线/括号
-        height_ratio_max=2.0,        # 连通域过高剔除阈值：h > median_h_all * ratio 认为是小节线
-        row_tolerance_factor=0.6,    # 行聚类 y 容差（系数 * 数字中位高）
-        pad_ratio=0.15,              # OCR 时为候选框添加的 padding（相对 max(w,h)）
-        ocr_scale=3.0,               # 单字符 OCR 放大倍率
-        ocr_dilate_kernel=2,         # OCR fallback 时膨胀核尺寸（像素）
-        search_width_factor=0.75,    # 点搜索区域宽度（相对数字高度）
-        margin_y_factor=0.01,         # 点搜索区域上下边距（相对数字高度）
-        search_height_factor=1.25,   # 点搜索区域高度（相对数字高度）
-        max_dot_size_factor=0.35,    # 认定为点的最大宽/高（相对数字高度）
-        cx_tol_factor=0.2,           # 点中心与数字中心的水平容差（相对数字高度）
+    return DetectionResult(
+        image_path=image_path,
+        notes=notes,
+        row_center_y=row_center_y,
+        raw_boxes=raw_boxes,
     )
-    notes, row_center_y, raw_boxes = extract_notes(image_path, params=params, key=key)
-
-    print(f"Detected {len(notes)} notes:")
-    for i, n in enumerate(notes, 1):
-        cx, cy = n.center()
-        print(
-            f"{i:2d}. degree={n.degree}, "
-            f"octave_offset={n.octave_offset:+d}, "
-            f"bbox=({n.x},{n.y},{n.w},{n.h}), "
-            f"center=({cx},{cy}), "
-            f"pitch={n.pitch}, "
-            f"articulation={'head' if n.articulation else 'tie'}"
-        )
-
-    if notes:
-        draw_notes_on_image(image_path, notes, row_center_y=row_center_y, raw_boxes=raw_boxes)
-    else:
-        print("No notes to draw.")
-
-
-if __name__ == "__main__":
-    main()
