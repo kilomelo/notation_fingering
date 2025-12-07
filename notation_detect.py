@@ -60,15 +60,31 @@ def normalize_key(key: str) -> str:
 
 
 def degree_to_pitch(key: str, degree: int, octave_offset: int) -> str:
-    """按调号和八度偏移计算音高字符串（基准八度 3）。"""
+    """
+    按调号和八度偏移计算音高字符串：
+    - 基础八度从 3 起步，按字母跨越 B->C 时自动 +1；
+    - 八度偏移不低于该级的基础八度（避免非 C 调因跨 C 而错位）。
+    """
     if degree <= 0:
         return "Rest"
     key_norm = normalize_key(key)
     scale = KEY_SCALES[key_norm]
     idx = (degree - 1) % 7
     note_name = scale[idx]
-    base_octave = 3  # 1度所在的基准八度
-    octave = base_octave + octave_offset
+
+    # 计算该调每个级数的基础八度
+    base_octaves = []
+    octave = 4
+    prev_letter = scale[0][0]
+    for name in scale:
+        letter = name[0]
+        if base_octaves and prev_letter > letter:
+            octave += 1  # 跨过 C，八度 +1
+        base_octaves.append(octave)
+        prev_letter = letter
+
+    base_oct = base_octaves[idx]
+    octave = max(base_oct, base_oct + octave_offset)
     return f"{note_name}{octave}"
 
 @dataclass

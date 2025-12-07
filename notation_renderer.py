@@ -10,6 +10,9 @@ def export_notation(
     source_offset: tuple,
     detection: DetectionResult,
     bg_path: str = None,
+    fingering_img_path: str = None,
+    fingering_img_offset: tuple = (0, 0),
+    fingering_scale: float = 1.0,
 ) -> None:
     """
     将源图渲染到指定分辨率的透明画布上，并按键控制保存。
@@ -20,6 +23,9 @@ def export_notation(
         source_offset: (x_offset, y_offset) 源图左上角在输出中的偏移。
         detection: extract_notes 返回的 DetectionResult 对象。
         bg_path: 背景图片路径；为空则使用不透明白底。
+        fingering_img_path: 指法图目录，为空则不渲染指法图。
+        fingering_img_offset: (x_offset, y_offset)，指法图顶边中点相对音符中心/行的偏移。
+        fingering_scale: 指法图缩放系数，默认 1.0。
     """
     width, height = target_resolution  # 解析目标画布的宽度和高度
     x_off, y_off = source_offset  # 解析源图在目标画布上的偏移量
@@ -88,6 +94,80 @@ def export_notation(
     out = np.concatenate([out_rgb, out_a], axis=2)
 
     canvas[y1:y2, x1:x2, :] = out
+
+    # 指法图渲染（仅音头）
+    def blend_alpha(dst: np.ndarray, fg: np.ndarray):
+        dst_rgb, dst_a = dst[..., :3], dst[..., 3:4]
+        fg_rgb, fg_a = fg[..., :3], fg[..., 3:4]
+        out_a = fg_a + dst_a * (1.0 - fg_a)
+        out_rgb = fg_rgb * fg_a + dst_rgb * dst_a * (1.0 - fg_a)
+        # 去预乘
+        out_rgb = np.where(out_a > 1e-6, out_rgb / out_a, 0)
+        return np.concatenate([out_rgb, out_a], axis=2)
+
+    if fingering_img_path and detection.row_center_y is not None:
+        cache = {}
+        fx_off, fy_off = fingering_img_offset
+        for note in detection.notes:
+            if not note.articulation:
+                continue
+            fname = f"{note.pitch}_0_off.png"
+            fpath = os.path.join(fingering_img_path, fname)
+            if fpath in cache:
+                fing_img = cache[fpath]
+            else:
+                if not os.path.exists(fpath):
+                    print(f"Warning: fingering image not found: {fpath}")
+                    cache[fpath] = None
+                    continue
+                img = cv2.imread(fpath, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    print(f"Warning: cannot read fingering image: {fpath}")
+                    cache[fpath] = None
+                    continue
+                if img.shape[2] == 3:
+                    alpha_f = np.ones(img.shape[:2], dtype=np.uint8) * 255
+                    img = np.dstack([img, alpha_f])
+                elif img.shape[2] == 4:
+                    pass
+                else:
+                    print(f"Warning: unsupported channels in fingering image: {fpath}")
+                    cache[fpath] = None
+                    continue
+                if fingering_scale != 1.0:
+                    new_w = max(1, int(round(img.shape[1] * fingering_scale)))
+                    new_h = max(1, int(round(img.shape[0] * fingering_scale)))
+                    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                cache[fpath] = img
+                fing_img = img
+            if fing_img is None:
+                continue
+
+            fg_h, fg_w = fing_img.shape[:2]
+            cx_note = source_offset[0] + note.x + note.w // 2 + fx_off
+            top_y = source_offset[1] + detection.row_center_y + fy_off
+            tl_x = int(round(cx_note - fg_w / 2))
+            tl_y = int(round(top_y))
+            br_x = tl_x + fg_w
+            br_y = tl_y + fg_h
+
+            # 裁剪到画布
+            clip_x1 = max(0, tl_x)
+            clip_y1 = max(0, tl_y)
+            clip_x2 = min(target_resolution[0], br_x)
+            clip_y2 = min(target_resolution[1], br_y)
+            if clip_x1 >= clip_x2 or clip_y1 >= clip_y2:
+                continue
+
+            fg_x1 = clip_x1 - tl_x
+            fg_y1 = clip_y1 - tl_y
+            fg_x2 = fg_x1 + (clip_x2 - clip_x1)
+            fg_y2 = fg_y1 + (clip_y2 - clip_y1)
+
+            fg_crop = fing_img[fg_y1:fg_y2, fg_x1:fg_x2, :].astype(np.float32) / 255.0
+            dst_roi = canvas[clip_y1:clip_y2, clip_x1:clip_x2, :]
+            blended = blend_alpha(dst_roi, fg_crop)
+            canvas[clip_y1:clip_y2, clip_x1:clip_x2, :] = blended
 
     # 显示窗口
     canvas_uint8 = (canvas * 255.0).clip(0, 255).astype(np.uint8)

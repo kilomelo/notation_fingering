@@ -4,12 +4,15 @@ from notation_renderer import export_notation
 
 def main():
     # 示例参数，可按需调整
-    image_path = "jianpu5.png"  # 替换成你的简谱图片路径
+    image_path = "pu.png"  # 替换成你的简谱图片路径
     key = "G"               # 调号，形如 C, G, Bb, F# 等
     target_path = "output1.png"
-    target_resolution = (1920, 540)  # (width, height)
-    source_offset = (200, 50)           # (x_offset, y_offset)
-    bg_path = "bg.jpeg"
+    target_resolution = (1800, 500)  # (width, height)
+    source_offset = (60, 10)           # (x_offset, y_offset)
+    bg_path = "bg.png"
+    fingering_img_path = "fingering_img_cut_fade"   # 指法图目录
+    fingering_img_offset = (0, 50)    # 指法图顶边中点相对音符中心/行的偏移
+    fingering_scale = 0.25             # 指法图缩放系数
 
     params = DetectParams(
         upscale=1.0,                 # 全图 OCR 前的放大倍率（保留入口，当前未使用额外放大）
@@ -19,7 +22,7 @@ def main():
         height_ratio_max=2.0,        # 连通域过高剔除阈值：h > median_h_all * ratio 认为是小节线
         row_tolerance_factor=0.6,    # 行聚类 y 容差（系数 * 数字中位高）
         pad_ratio=0.15,              # OCR 时为候选框添加的 padding（相对 max(w,h)）
-        ocr_scale=3.0,               # 单字符 OCR 放大倍率
+        ocr_scale=2.0,               # 单字符 OCR 放大倍率
         ocr_dilate_kernel=2,         # OCR fallback 时膨胀核尺寸（像素）
         search_width_factor=0.75,    # 点搜索区域宽度（相对数字高度）
         margin_y_factor=0.01,        # 点搜索区域上下边距（相对数字高度）
@@ -48,6 +51,9 @@ def main():
         source_offset=source_offset,
         detection=result,
         bg_path=bg_path,
+        fingering_img_path=fingering_img_path,
+        fingering_img_offset=fingering_img_offset,
+        fingering_scale=fingering_scale,
     )
 
 
