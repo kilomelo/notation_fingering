@@ -145,6 +145,13 @@ def batch_fade_images(input_dir, fade_height_percent):
     
     print("-" * 50)
     print(f"处理完成! 成功: {processed_count}, 失败: {error_count}")
+    # 记录参数
+    params_path = os.path.join(output_dir, "parameters.ini")
+    try:
+        with open(params_path, "w", encoding="utf-8") as f:
+            f.write(f"{input_dir} {fade_height_percent}")
+    except Exception as e:
+        print(f"Warning: 写入参数文件失败: {params_path} - {e}")
     print(f"所有处理后的图片已保存为PNG格式以保留透明度信息")
 
 def main():

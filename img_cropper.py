@@ -63,9 +63,15 @@ def batch_crop_images(input_dir, target_width, target_height, offset_x=0, offset
                     right = min(original_width, right)
                     bottom = min(original_height, bottom)
                     
+                    # 转为整数坐标
+                    left_i = int(round(left))
+                    top_i = int(round(top))
+                    right_i = int(round(right))
+                    bottom_i = int(round(bottom))
+                    
                     # 如果裁剪区域小于目标分辨率，进行调整
-                    actual_width = right - left
-                    actual_height = bottom - top
+                    actual_width = right_i - left_i
+                    actual_height = bottom_i - top_i
                     
                     if actual_width < target_width or actual_height < target_height:
                         # 创建目标大小的新图片（黑色背景）
@@ -80,7 +86,7 @@ def batch_crop_images(input_dir, target_width, target_height, offset_x=0, offset
                         paste_y = (target_height - actual_height) // 2 if actual_height < target_height else 0
                         
                         # 裁剪原图
-                        cropped_img = img.crop((left, top, right, bottom))
+                        cropped_img = img.crop((left_i, top_i, right_i, bottom_i))
                         
                         # 将裁剪的图片粘贴到新图片上
                         new_img.paste(cropped_img, (paste_x, paste_y))
@@ -95,7 +101,7 @@ def batch_crop_images(input_dir, target_width, target_height, offset_x=0, offset
                             new_img.save(output_path)
                     else:
                         # 直接裁剪并保存
-                        cropped_img = img.crop((left, top, right, bottom))
+                        cropped_img = img.crop((left_i, top_i, right_i, bottom_i))
                         cropped_img.save(output_path)
                     
                     print(f"✓ 已处理: {filename} ({original_width}x{original_height} → {target_width}x{target_height})")
@@ -107,6 +113,13 @@ def batch_crop_images(input_dir, target_width, target_height, offset_x=0, offset
     
     print("-" * 50)
     print(f"处理完成! 成功: {processed_count}, 失败: {error_count}")
+    # 记录参数
+    params_path = os.path.join(output_dir, "parameters.ini")
+    try:
+        with open(params_path, "w", encoding="utf-8") as f:
+            f.write(f"{input_dir} {target_width} {target_height} --offset_x {offset_x} --offset_y {offset_y}")
+    except Exception as e:
+        print(f"Warning: 写入参数文件失败: {params_path} - {e}")
 
 def main():
     """主函数，处理命令行参数"""
