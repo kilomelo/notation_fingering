@@ -1,30 +1,23 @@
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+
 import cv2
 import numpy as np
-from dataclasses import dataclass, field
-from typing import List, Optional
-from PIL import Image
-import pytesseract
 
-# 调试信息输出等级（越大越多），默认 1；打印时用 log(level, msg)
-INFO_LEVEL = 1
-
-
-def log(level: int, msg: str) -> None:
-    if INFO_LEVEL >= level:
-        print(msg)
-
-
-# 简单的大小调调号集合（主音 + 升降号），用于合法性校验与音高拼写
+# 调号音阶表
 KEY_SCALES = {
-    "C":  ["C", "D", "E", "F", "G", "A", "B"],
-    "G":  ["G", "A", "B", "C", "D", "E", "F#"],
-    "D":  ["D", "E", "F#", "G", "A", "B", "C#"],
-    "A":  ["A", "B", "C#", "D", "E", "F#", "G#"],
-    "E":  ["E", "F#", "G#", "A", "B", "C#", "D#"],
-    "B":  ["B", "C#", "D#", "E", "F#", "G#", "A#"],
+    "C": ["C", "D", "E", "F", "G", "A", "B"],
+    "G": ["G", "A", "B", "C", "D", "E", "F#"],
+    "D": ["D", "E", "F#", "G", "A", "B", "C#"],
+    "A": ["A", "B", "C#", "D", "E", "F#", "G#"],
+    "E": ["E", "F#", "G#", "A", "B", "C#", "D#"],
+    "B": ["B", "C#", "D#", "E", "F#", "G#", "A#"],
     "F#": ["F#", "G#", "A#", "B", "C#", "D#", "E#"],
     "C#": ["C#", "D#", "E#", "F#", "G#", "A#", "B#"],
-    "F":  ["F", "G", "A", "Bb", "C", "D", "E"],
+    "F": ["F", "G", "A", "Bb", "C", "D", "E"],
     "Bb": ["Bb", "C", "D", "Eb", "F", "G", "A"],
     "Eb": ["Eb", "F", "G", "Ab", "Bb", "C", "D"],
     "Ab": ["Ab", "Bb", "C", "Db", "Eb", "F", "G"],
@@ -33,414 +26,404 @@ KEY_SCALES = {
     "Cb": ["Cb", "Db", "Eb", "Fb", "Gb", "Ab", "Bb"],
 }
 
+NOTE_TO_SEMI = {
+    "C": 0,
+    "C#": 1,
+    "Db": 1,
+    "D": 2,
+    "D#": 3,
+    "Eb": 3,
+    "E": 4,
+    "Fb": 4,
+    "E#": 5,
+    "F": 5,
+    "F#": 6,
+    "Gb": 6,
+    "G": 7,
+    "G#": 8,
+    "Ab": 8,
+    "A": 9,
+    "A#": 10,
+    "Bb": 10,
+    "B": 11,
+    "Cb": 11,
+}
+
+SEMI_TO_NOTE_SHARP = {0: "C", 1: "C#", 2: "D", 3: "D#", 4: "E", 5: "F", 6: "F#", 7: "G", 8: "G#", 9: "A", 10: "A#", 11: "B"}
+SEMI_TO_NOTE_FLAT = {0: "C", 1: "Db", 2: "D", 3: "Eb", 4: "E", 5: "F", 6: "Gb", 7: "G", 8: "Ab", 9: "A", 10: "Bb", 11: "B"}
+
+
+@dataclass
+class NoteInfo:
+    degree: int
+    accidental: int  # -1 flat, 0 natural, +1 sharp
+    octave_offset: int
+    pitch: str
+    articulation: bool
+    bbox: Tuple[int, int, int, int]
+    center: Tuple[float, float]
+    row_center_y: float
+    dot_boxes: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    slur_boxes: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    acc_box: Tuple[int, int, int, int] = None
+    dots_hit: List[Tuple[float, float]] = field(default_factory=list)
+
+
+@dataclass
+class DetectParams:
+    acc_box_ratio: float = 0.6       # 升降号检测框宽高系数（相对数字高度，右下角对齐数字中心）
+    dot_box_ratio_x: float = 0.6     # 上下点检测框宽系数（相对数字高度，贴靠数字上下边沿）
+    dot_box_ratio_y: float = 1.2     # 上下点检测框高系数（相对数字高度，贴靠数字上下边沿）
+    slur_w_ratio: float = 0.7        # 延音线检测框宽度系数（相对数字高度，位于数字上方）
+    slur_h_ratio: float = 2          # 延音线检测框高度系数（相对数字高度，位于数字上方）
+
 
 def normalize_key(key: str) -> str:
-    """校验并规范调号，不合法则返回 'C' 并输出 warning。"""
-    if not isinstance(key, str):
-        log(0, "Warning: key must be string, fallback to 'C'")
-        return "C"
-    k = key.strip()
-    if len(k) == 0 or len(k) > 2:
-        log(0, f"Warning: invalid key '{key}', fallback to 'C'")
-        return "C"
-    if len(k) == 1:
-        if k in KEY_SCALES:
-            return k
-        log(0, f"Warning: invalid key '{key}', fallback to 'C'")
-        return "C"
-    # len == 2
-    base, accidental = k[0], k[1]
-    if base not in "CDEFGAB" or accidental not in "#b":
-        log(0, f"Warning: invalid key '{key}', fallback to 'C'")
-        return "C"
-    if k in KEY_SCALES:
-        return k
-    log(0, f"Warning: unsupported key '{key}', fallback to 'C'")
-    return "C"
+    return key if key in KEY_SCALES else "C"
 
 
-def degree_to_pitch(key: str, degree: int, octave_offset: int) -> str:
-    """
-    按调号和八度偏移计算音高字符串：
-    - 基础八度从 3 起步，按字母跨越 B->C 时自动 +1；
-    - 八度偏移不低于该级的基础八度（避免非 C 调因跨 C 而错位）。
-    """
-    if degree <= 0:
-        return "Rest"
-    key_norm = normalize_key(key)
-    scale = KEY_SCALES[key_norm]
-    idx = (degree - 1) % 7
-    note_name = scale[idx]
-
-    # 计算该调每个级数的基础八度
+def build_base_octaves(scale: List[str]) -> List[int]:
     base_octaves = []
-    octave = 4
+    octave = 3
     prev_letter = scale[0][0]
     for name in scale:
         letter = name[0]
         if base_octaves and prev_letter > letter:
-            octave += 1  # 跨过 C，八度 +1
+            octave += 1
         base_octaves.append(octave)
         prev_letter = letter
+    return base_octaves
 
+
+def name_to_semi(name: str) -> int:
+    return NOTE_TO_SEMI.get(name, 0)
+
+
+def semi_to_name(semi: int, prefer_flat: bool) -> str:
+    semi = semi % 12
+    return SEMI_TO_NOTE_FLAT[semi] if prefer_flat else SEMI_TO_NOTE_SHARP[semi]
+
+
+def degree_to_pitch(scale: List[str], base_octaves: List[int], degree: int, accidental: int, octave_offset: int, prefer_flat: bool) -> str:
+    idx = (degree - 1) % 7
+    base_name = scale[idx]
     base_oct = base_octaves[idx]
-    octave = max(base_oct, base_oct + octave_offset)
-    return f"{note_name}{octave}"
-
-@dataclass
-class DetectParams:
-    """集中配置识别阈值/系数，方便统一调整。"""
-    upscale: float = 1.0                  # OCR 之前的整体缩放（目前未额外缩放，保留以便调节）
-    area_min_factor: float = 0.2          # 连通域面积下限（相对中位数）
-    area_max_factor: float = 4.5          # 连通域面积上限（相对中位数）
-    width_height_ratio_max: float = 1.0   # 候选过宽剔除阈值（w > h * ratio）
-    height_ratio_max: float = 2.0         # 候选过高剔除阈值（h > median_h_all * ratio）
-    row_tolerance_factor: float = 0.6     # 行聚类 y 容差系数（乘以数字中位高）
-    pad_ratio: float = 0.15               # OCR 裁剪时的边缘 padding（相对 max(w,h)）
-    ocr_scale: float = 3.0                # 单字符 OCR 的放大倍数
-    ocr_dilate_kernel: int = 2            # fallback 膨胀核尺寸（正方形核边长）
-    search_width_factor: float = 0.75     # 点搜索区宽度系数（相对数字高）
-    margin_y_factor: float = 0.01         # 点搜索区上下边距（相对数字高）
-    search_height_factor: float = 1.25    # 点搜索区高度（相对数字高）
-    max_dot_size_factor: float = 0.35     # 点尺寸上限（相对数字高）
-    cx_tol_factor: float = 0.2            # 点中心与数字中心的水平容差（相对数字高）
-    slur_ratio: float = 2.0               # 判定为连音线的宽高比阈值（w >= h * slur_ratio）
-
-# 如果 Tesseract 不在 PATH，需要手动指定安装路径，例如：
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    semi = name_to_semi(base_name) + accidental
+    # 调整八度跨越
+    add_oct = 0
+    while semi < 0:
+        semi += 12
+        add_oct -= 1
+    while semi >= 12:
+        semi -= 12
+        add_oct += 1
+    octave = base_oct + octave_offset + add_oct
+    name = semi_to_name(semi, prefer_flat)
+    return f"{name}{octave}"
 
 
-@dataclass
-class Note:
-    """表示一个简谱音符（只考虑音级 + 上下点）"""
-    degree: int          # 0-7
-    octave_offset: int   # 上下点数量之差：上点为正，下点为负
-    x: int               # 数字框左上角 x
-    y: int               # 数字框左上角 y
-    w: int               # 数字框宽
-    h: int               # 数字框高
-    dots: List[tuple] = field(default_factory=list)  # 记录检测到的点的中心坐标列表
-    search_regions: List[tuple] = field(default_factory=list)  # 点搜索区域 (x1,y1,x2,y2)
-    pitch: str = ""      # 计算得到的音高字符串（如 C4、F#4 等）
-    slur_start_ids: List[int] = field(default_factory=list)  # 以该音为起点的连音线 id
-    slur_end_ids: List[int] = field(default_factory=list)    # 以该音为终点的连音线 id
-    articulation: bool = True  # True 表示音头，False 表示延音
-
-    def center(self):
-        return (self.x + self.w // 2, self.y + self.h // 2)
-
-
-@dataclass
-class DetectionResult:
-    """extract_notes 的输出容器"""
-    image_path: str
-    notes: List[Note]
-    row_center_y: Optional[int]
-    raw_boxes: List[tuple]
-
-
-def extract_notes(image_path: str, params: Optional[DetectParams] = None, key: str = "C") -> DetectionResult:
-    """
-    从单行简谱图片中提取音符列表。
-
-    参数：
-        image_path: 输入图片路径。
-        params: DetectParams，可选，集中配置各类阈值；不传则用默认。
-        key: 调号字符串，形如 "C", "G", "Bb", "F#", 默认 "C"。首字符必须是 A-G 之一，可选第二字符为 # 或 b。
-
-    返回：
-        notes: List[Note]，按 x 从左到右排序，包含 pitch、八度偏移、点等信息。
-        row_center_y: 主行中心 y，用于调试行绘制。
-        raw_boxes: 原始连通域列表 (id, x, y, w, h)，用于调试。
-    """
-    if params is None:
-        params = DetectParams()
-    key_norm = normalize_key(key)
-
-    # 1. 读图
-    img_bgr = cv2.imread(image_path)
-    if img_bgr is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    h_img, w_img = gray.shape[:2]
-
-    # 2. 为了后面找“点”，先做一个简单的二值化（黑字白底 -> 反转成白字黑底）
-    #    注：你说是印刷谱，我们直接用 OTSU 阈值就行
-    _, binary_inv = cv2.threshold(
-        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
-    # binary_inv: 黑底白字（包括数字和点）
-
-    # 3. 连通域分割 + 单字符 OCR：不假设行位置，先找到所有小块再逐个识别。
-    contours, _ = cv2.findContours(
-        binary_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    candidates = []
-    raw_boxes = []
-    slur_boxes = []
-    areas = []
-    for idx, cnt in enumerate(contours, 1):
-        x, y, w, h = cv2.boundingRect(cnt)
-        area = w * h
-        if area < 6:  # 太小的噪声
-            continue
-        areas.append(area)
-        raw_boxes.append((idx, x, y, w, h))  # 保留原始序号
-        candidates.append({"id": idx, "x": x, "y": y, "w": w, "h": h})
-
-    if not candidates:
-        log(1, "No contours found.")
-        return [], None, raw_boxes
-
-    median_area = np.median(areas)
-    median_h_all = np.median([c["h"] for c in candidates])
-    log(1, f"Median area: {median_area}, median height: {median_h_all}")
-
-    def _to_digit(ch: str, w: int, h: int, median_h: float):
-        """把易混字符归一成数字，同时用尺寸过滤掉小节线等竖条。"""
-        if ch in "01234567":
-            return int(ch)
-        if ch in ["I", "l", "|", "i"]:
-            # 太细太高的，多半是小节线，丢弃
-            if w < 0.25 * h or h > 2.8 * median_h:
-                return None
-            return 1
-        return None
-
-    def ocr_single_char(crop_gray: np.ndarray) -> str:
-        """对单个字符区域做 OCR（单字符模式），带兜底增强。"""
-        if crop_gray.size == 0:
-            return ""
-
-        def _try_ocr(img_gray: np.ndarray, dilate: bool) -> str:
-            # resize
-            scale = params.ocr_scale
-            roi = cv2.resize(
-                img_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
-            )
-            _, roi = cv2.threshold(
-                roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
-            if dilate:
-                k = params.ocr_dilate_kernel
-                roi = cv2.dilate(roi, np.ones((k, k), np.uint8), iterations=1)
-            roi = cv2.bitwise_not(roi)  # 黑字白底
-            txt = pytesseract.image_to_string(
-                Image.fromarray(roi),
-                config=r'--oem 3 --psm 10 -c tessedit_char_whitelist=01234567Il|'
-            )
-            return txt.strip()
-
-        # 先常规，再尝试膨胀增强笔画
-        txt = _try_ocr(crop_gray, dilate=False)
-        if txt:
-            return txt
-        txt = _try_ocr(crop_gray, dilate=True)
-        if txt:
-            log(2, "OCR fallback (dilate) succeeded")
-        return txt
-
-    # 粗过滤极端尺寸的候选框，同时识别可能的连音线
-    size_filtered = []
-    for cand in candidates:
-        x, y, w, h = cand["x"], cand["y"], cand["w"], cand["h"]
-        area = w * h
-        ratio = w / h if h else float("inf")
-        if ratio >= params.slur_ratio:
-            slur_boxes.append({"id": cand["id"], "x": x, "y": y, "w": w, "h": h})
-            continue
-        if area < median_area * params.area_min_factor:
-            log(2, f"Skip cand#{cand['id']} area too small ({area})")
-            continue
-        if area > median_area * params.area_max_factor:
-            log(2, f"Skip cand#{cand['id']} area too large ({area})")
-            continue
-        if w > h * params.width_height_ratio_max:  # 连音线、括号等长条
-            log(2, f"Skip cand#{cand['id']} too wide (w={w}, h={h})")
-            continue
-        if h > median_h_all * params.height_ratio_max:  # 高竖线（小节线）
-            log(2, f"Skip cand#{cand['id']} too tall (h={h})")
-            continue
-        size_filtered.append(cand)
-
-    if not size_filtered:
-        log(0, "No candidates after size filtering.")
-        return [], None, raw_boxes
-
-    heights = [c["h"] for c in size_filtered]
-    median_h = np.median(heights)
-
-    recognized_boxes = []
-    for cand in size_filtered:
-        x, y, w, h = cand["x"], cand["y"], cand["w"], cand["h"]
-        pad = int(max(1, params.pad_ratio * max(w, h)))
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(w_img, x + w + pad)
-        y2 = min(h_img, y + h + pad)
-        crop = gray[y1:y2, x1:x2]
-        text = ocr_single_char(crop)
-        if not text:
-            log(2, f"Skip cand#{cand['id']} OCR empty")
-            continue
-        ch = text[0]
-        degree = _to_digit(ch, w, h, median_h)
-        if degree is None:
-            log(2, f"Skip cand#{cand['id']} OCR '{ch}' not digit-like")
-            continue
-        recognized_boxes.append({"id": cand["id"], "degree": degree, "x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1})
-
-    if not recognized_boxes:
-        log(0, "No digits 0-7 detected by per-char OCR.")
-        return [], None, raw_boxes
-
-    # 按 y 聚类：同一行的数字应该在同一 y 段，取数量最多的行
+def cluster_digits(digits: List[Tuple[int, int, int, int, float]], tol_factor: float = 0.6):
+    heights = [h for _, _, _, h, _ in digits]
+    median_h = np.median(heights) if heights else 0
     row_bins = []
-    row_tolerance = median_h * params.row_tolerance_factor
-    for box in recognized_boxes:
-        x, y, w, h = box["x"], box["y"], box["w"], box["h"]
-        cy = y + h / 2
+    tol = median_h * tol_factor if median_h > 0 else 0
+    for box in digits:
+        _, y, _, h, _ = box
+        cy = y + h / 2.0
         placed = False
-        for bin in row_bins:
-            if abs(bin["cy_mean"] - cy) <= row_tolerance:
-                bin["items"].append(box)
-                bin["cy_values"].append(cy)
-                bin["cy_mean"] = np.mean(bin["cy_values"])
+        for b in row_bins:
+            if abs(b["cy_mean"] - cy) <= tol:
+                b["items"].append(box)
+                b["cy_values"].append(cy)
+                b["cy_mean"] = np.mean(b["cy_values"])
                 placed = True
                 break
         if not placed:
             row_bins.append({"items": [box], "cy_values": [cy], "cy_mean": cy})
-
     row_bins.sort(key=lambda b: len(b["items"]), reverse=True)
-    main_row = row_bins[0]
-    main_row_boxes = main_row["items"]
+    if not row_bins:
+        return [], None
+    main = row_bins[0]
+    return main["items"], main["cy_mean"]
 
-    if len(main_row_boxes) < len(recognized_boxes) // 2:
-        log(0, "Warning: many detected digits are off the main row; results may be noisy.")
 
-    digit_boxes = main_row_boxes
-    row_center_y = int(main_row["cy_mean"])
+def point_in_box(px, py, box):
+    x, y, w, h = box
+    return x <= px <= x + w and y <= py <= y + h
 
-    notes: List[Note] = []
 
-    # 4. 对每个数字，在其上下邻域找“点”（连通域）
-    for box in digit_boxes:
-        degree = box["degree"]
-        x, y, w, h = box["x"], box["y"], box["w"], box["h"]
-        # 定义搜索区域参数（可根据你实际图调）：
-        search_width = max(1, int(round(h * params.search_width_factor)))
-        margin_y = int(h * params.margin_y_factor)
-        search_height = int(h * params.search_height_factor)
-        dots = []
-        search_regions = []
+def load_matchinfo(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"matchinfo 文件不存在: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
 
-        cx_digit = x + w // 2
-        x1 = max(0, cx_digit - search_width // 2)
-        x2 = min(w_img, cx_digit + (search_width + 1) // 2)
 
-        # 上方搜索区域
-        above_y2 = max(0, y - margin_y)
-        above_y1 = max(0, above_y2 - search_height)
-        above_region = None
-        if above_y2 > above_y1:
-            search_regions.append((x1, above_y1, x2, above_y2))
-            above_region = (x1, above_y1, x2, above_y2)
-
-        # 下方搜索区域
-        below_y1 = min(h_img, y + h + margin_y)
-        below_y2 = min(h_img, below_y1 + search_height)
-        if below_y2 > below_y1:
-            search_regions.append((x1, below_y1, x2, below_y2))
-
-        num_dots_above = 0
-        num_dots_below = 0
-
-        max_dot_size = h * params.max_dot_size_factor
-        cx_tol = h * params.cx_tol_factor
-
-        def box_inside_region(bx, by, bw, bh, rx1, ry1, rx2, ry2) -> bool:
-            return bx >= rx1 and by >= ry1 and (bx + bw) <= rx2 and (by + bh) <= ry2
-        def point_in_region(px, py, region) -> bool:
-            x1r, y1r, x2r, y2r = region
-            return x1r <= px <= x2r and y1r <= py <= y2r
-
-        # ---- 搜索上方的点 ----
-        if above_y2 > above_y1:
-            for rid, bx, by, bw, bh in raw_boxes:
-                if bw >= max_dot_size or bh >= max_dot_size:
-                    continue
-                if not box_inside_region(bx, by, bw, bh, x1, above_y1, x2, above_y2):
-                    continue
-                cx_box = bx + bw / 2.0
-                if abs(cx_box - cx_digit) > cx_tol:
-                    continue
-                num_dots_above += 1
-                dots.append((int(cx_box), int(by + bh / 2.0)))
-
-        # ---- 搜索下方的点 ----
-        if below_y2 > below_y1:
-            for rid, bx, by, bw, bh in raw_boxes:
-                if bw >= max_dot_size or bh >= max_dot_size:
-                    continue
-                if not box_inside_region(bx, by, bw, bh, x1, below_y1, x2, below_y2):
-                    continue
-                cx_box = bx + bw / 2.0
-                if abs(cx_box - cx_digit) > cx_tol:
-                    continue
-                num_dots_below += 1
-                dots.append((int(cx_box), int(by + bh / 2.0)))
-
-        if num_dots_above > 0 and num_dots_below > 0:
-            log(0, f"Warning: both upper and lower dots detected at digit x={x}, y={y}")
-            num_dots_above = 0  # 规则：上点数置 0 再计算
-
-        # 为了简单：如果检测到很多点，就裁剪到 [-2, 2] 范围内
-        octave_offset = max(-2, min(2, num_dots_above - num_dots_below))
-        pitch = degree_to_pitch(key_norm, degree, octave_offset)
-
-        slur_starts = []
-        slur_ends = []
-        if above_region and slur_boxes:
-            for slur in slur_boxes:
-                sx, sy, sw, sh = slur["x"], slur["y"], slur["w"], slur["h"]
-                left_bottom = (sx, sy + sh)
-                right_bottom = (sx + sw, sy + sh)
-                if point_in_region(*left_bottom, above_region):
-                    slur_starts.append(slur["id"])
-                if point_in_region(*right_bottom, above_region):
-                    slur_ends.append(slur["id"])
-
-        note = Note(
-            degree=degree,
-            octave_offset=octave_offset,
-            x=x,
-            y=y,
-            w=w,
-            h=h,
-            dots=dots,
-            search_regions=search_regions,
-            pitch=pitch,
-            slur_start_ids=slur_starts,
-            slur_end_ids=slur_ends,
+def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = None):
+    """
+    使用 matchinfo JSON 进行乐谱解析。
+    返回 (notes_json_path, saved_flag)；若未按回车保存则返回 (None, False)。
+    """
+    key_norm = normalize_key(key)
+    if params is None:
+        params = DetectParams(
+            acc_box_ratio=0.6,        # 升降号检测框宽高系数（相对数字高度，右下角对齐数字中心）
+            dot_box_ratio_x=0.6,      # 上下点检测框宽系数（相对数字高度，贴靠数字上下边沿）
+            dot_box_ratio_y=1.2,      # 上下点检测框高系数（相对数字高度，贴靠数字上下边沿）
+            slur_w_ratio=0.7,         # 延音线检测框宽度系数（相对数字高度，位于数字上方）
+            slur_h_ratio=2,           # 延音线检测框高度系数（相对数字高度，位于数字上方）
         )
-        notes.append(note)
 
-    # 5. 从左到右排序（单行简谱）
-    notes.sort(key=lambda n: n.x)
+    try:
+        info = load_matchinfo(matchinfo_path)
+    except FileNotFoundError as e:
+        print(str(e))
+        return None, False
+    except json.JSONDecodeError as e:
+        print(f"错误: matchinfo 文件无法解析为 JSON: {e}")
+        return None, False
+    matches = info.get("matches", {})
+    replaced_img_path = info.get("replaced_img_path", "")
+    base_img = cv2.imread(replaced_img_path, cv2.IMREAD_COLOR)
+    if base_img is None:
+        print(f"错误: 无法读取替换后图片 {replaced_img_path}")
+        return None, False
 
-    # 6. articulation：若上一音 pitch 相同且共享同一条连音线（前音为起点，当前为终点），则当前不是音头
-    for i, note in enumerate(notes):
+    # 收集数字/符号
+    digit_boxes = []
+    sharp_boxes = [(b["x"], b["y"], b["w"], b["h"], b.get("score", 0)) for b in matches.get("sharp", [])]
+    flat_boxes = [(b["x"], b["y"], b["w"], b["h"], b.get("score", 0)) for b in matches.get("flat", [])]
+    dot_boxes = matches.get("dot", [])
+    dots_all = [(b["x"], b["y"], b["w"], b["h"], b.get("score", 0)) for b in dot_boxes]
+    slur_left_boxes = []
+    slur_right_boxes = []
+    for name, boxes in matches.items():
+        if name.isdigit():
+            deg = int(name)
+            if 0 <= deg <= 9:
+                for b in boxes:
+                    digit_boxes.append((deg, b["x"], b["y"], b["w"], b["h"], b.get("score", 0)))
+        if name.startswith("slur_left"):
+            slur_left_boxes.extend([(b["x"], b["y"], b["w"], b["h"], b.get("score", 0)) for b in boxes])
+        if name.startswith("slur_right"):
+            slur_right_boxes.extend([(b["x"], b["y"], b["w"], b["h"], b.get("score", 0)) for b in boxes])
+
+    if not digit_boxes:
+        print("未检测到数字。")
+        return
+
+    # 聚类行
+    digit_boxes_only = [(x, y, w, h, s) for _, x, y, w, h, s in digit_boxes]
+    main_row_boxes, row_center_y = cluster_digits(digit_boxes_only)
+    if not main_row_boxes:
+        print("未找到主行。")
+        return
+
+    # 构造 NoteInfo
+    notes: List[NoteInfo] = []
+    scale = KEY_SCALES[key_norm]
+    base_octaves = build_base_octaves(scale)
+    prefer_flat = "b" in key_norm
+
+    # 排序
+    main_digit_boxes = []
+    for deg, x, y, w, h, s in digit_boxes:
+        if (x, y, w, h, s) in main_row_boxes:
+            main_digit_boxes.append((deg, x, y, w, h, s))
+    main_digit_boxes.sort(key=lambda b: b[1])
+
+    for deg, x, y, w, h, s in main_digit_boxes:
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+
+        # 升降号检测框：右侧中点与数字中心对齐，宽高=acc_box_ratio*h
+        acc_w = acc_h = h * params.acc_box_ratio
+        acc_box = (int(cx - acc_w), int(cy - acc_h / 2), int(acc_w), int(acc_h))
+        accidental = 0
+        for bx, by, bw, bh, _ in sharp_boxes:
+            if point_in_box(bx + bw, by + bh, acc_box):
+                accidental = 1
+                break
+        if accidental == 0:
+            for bx, by, bw, bh, _ in flat_boxes:
+                if point_in_box(bx + bw, by + bh, acc_box):
+                    accidental = -1
+                    break
+
+        # 上下点检测框
+        dot_w = h * params.dot_box_ratio_x
+        dot_h = h * params.dot_box_ratio_y
+        above_box = (int(cx - dot_w / 2), int(y - dot_h), int(dot_w), int(dot_h))
+        below_box = (int(cx - dot_w / 2), int(y + h), int(dot_w), int(dot_h))
+        dots_above = 0
+        dots_below = 0
+        dots_hit = []
+        for d in dot_boxes:
+            dx, dy = d["center"][0], d["center"][1]
+            if point_in_box(dx, dy, above_box):
+                dots_above += 1
+                dots_hit.append((dx, dy))
+            elif point_in_box(dx, dy, below_box):
+                dots_below += 1
+                dots_hit.append((dx, dy))
+        octave_offset = max(-2, min(2, dots_above - dots_below))
+
+        # 延音线检测框（上方，宽高比例不同）
+        slur_w = h * params.slur_w_ratio
+        slur_h = h * params.slur_h_ratio
+        slur_box = (int(cx - slur_w / 2), int(y - slur_h), int(slur_w), int(slur_h))
+
+        pitch = degree_to_pitch(scale, base_octaves, deg if deg != 0 else 7, accidental, octave_offset, prefer_flat)
+
+        notes.append(
+            NoteInfo(
+                degree=deg,
+                accidental=accidental,
+                octave_offset=octave_offset,
+                pitch=pitch,
+                articulation=True,  # 先占位，稍后计算
+                bbox=(x, y, w, h),
+                center=(cx, cy),
+                row_center_y=row_center_y,
+                dot_boxes=[above_box, below_box],
+                slur_boxes=[slur_box],
+                acc_box=acc_box,
+                dots_hit=dots_hit,
+            )
+        )
+
+    # articulation 判定（利用 slur 检测状态）
+    for i, n in enumerate(notes):
+        n.slur_start = False
+        n.slur_end = False
+        # 使用已有检测结果判断左/右
+        slur_box = n.slur_boxes[0]
+        for bx, by, bw, bh, _ in slur_left_boxes:
+            if point_in_box(bx, by + bh, slur_box):
+                n.slur_start = True
+                break
+        for bx, by, bw, bh, _ in slur_right_boxes:
+            if point_in_box(bx + bw, by + bh, slur_box):
+                n.slur_end = True
+                break
+
+    for i, n in enumerate(notes):
         if i == 0:
-            note.articulation = True
+            n.articulation = True
             continue
         prev = notes[i - 1]
-        shared_slur = set(prev.slur_start_ids) & set(note.slur_end_ids)
-        note.articulation = not (note.pitch == prev.pitch and len(shared_slur) > 0)
+        n.articulation = not (n.pitch == prev.pitch and prev.slur_start and n.slur_end)
 
-    return DetectionResult(
-        image_path=image_path,
-        notes=notes,
-        row_center_y=row_center_y,
-        raw_boxes=raw_boxes,
-    )
+    # 可视化
+    colors = [(0, 0, 255), (0, 165, 255), (255, 0, 0), (0, 128, 128), (128, 0, 128)]
+    # 基本信息输出
+    print(f"Row center y: {row_center_y}")
+    print(f"Detected {len(notes)} notes:")
+    for i, n in enumerate(notes, 1):
+        print(
+            f"{i:2d}. degree={n.degree}, accidental={n.accidental:+d}, octave_offset={n.octave_offset:+d}, "
+            f"pitch={n.pitch}, articulation={'head' if n.articulation else 'tie'}, "
+            f"bbox=({n.bbox[0]},{n.bbox[1]},{n.bbox[2]},{n.bbox[3]}), center=({n.center[0]:.1f},{n.center[1]:.1f})"
+        )
+    mode = 1  # 0:原图, 1:数字+行线, 2:上下点框, 3:升降号框, 4:延音线框
+    saved = False
+    out_json = None
+    while True:
+        vis = base_img.copy()
+        if mode == 0:
+            show = vis
+        else:
+            if mode == 1:
+                cv2.line(vis, (0, int(row_center_y)), (vis.shape[1], int(row_center_y)), (255, 0, 255), 1)
+            # 全局渲染：按模式绘制 JSON 中的所有对象
+            if mode == 2:
+                for bx, by, bw, bh, _ in dots_all:
+                    cv2.rectangle(vis, (int(bx), int(by)), (int(bx + bw), int(by + bh)), (0, 200, 200), 1)
+            elif mode == 3:
+                for bx, by, bw, bh, _ in sharp_boxes:
+                    cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), (0, 140, 200), 1)
+                for bx, by, bw, bh, _ in flat_boxes:
+                    cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), (200, 0, 0), 1)
+            elif mode == 4:
+                for bx, by, bw, bh, _ in slur_left_boxes:
+                    cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), (0, 160, 0), 1)
+                for bx, by, bw, bh, _ in slur_right_boxes:
+                    cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), (160, 0, 160), 1)
+            for idx, n in enumerate(notes):
+                color = colors[idx % len(colors)]
+                x, y, w, h = n.bbox
+                # 共用右侧 pitch label
+                pitch_text = n.pitch
+                cv2.putText(vis, pitch_text, (x + w + 2, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                if mode == 1:
+                    cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
+                elif mode == 2:
+                    for bx, by, bw, bh in n.dot_boxes:
+                        cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), color, 1)
+                    for dx, dy in n.dots_hit:
+                        cv2.circle(vis, (int(dx), int(dy)), 3, color, -1)
+                    cv2.putText(vis, f"{n.octave_offset:+d}", (x + w + 2, y + h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                elif mode == 3:
+                    ax, ay, aw, ah = n.acc_box
+                    cv2.rectangle(vis, (ax, ay), (ax + aw, ay + ah), color, 1)
+                    cv2.putText(vis, f"{n.accidental:+d}", (x + w + 2, y + h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                elif mode == 4:
+                    for bx, by, bw, bh in n.slur_boxes:
+                        cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), color, 1)
+                    slur_state = "none"
+                    if n.slur_start and n.slur_end:
+                        slur_state = "both"
+                    elif n.slur_start:
+                        slur_state = "left"
+                    elif n.slur_end:
+                        slur_state = "right"
+                    cv2.putText(vis, slur_state, (x + w + 2, y + h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+            show = vis
+        cv2.imshow("notation_detect", show)
+        key_code = cv2.waitKey(0) & 0xFF
+        if key_code == 32:
+            mode = (mode + 1) % 5
+            continue
+        if key_code in (13, 10):
+            base_dir = os.path.dirname(os.path.abspath(replaced_img_path))
+            stem = os.path.splitext(os.path.basename(info.get("src_img_path", "")))[0]
+            out_json = os.path.join(base_dir, f"{stem}_notes.json")
+            data = {
+                "replaced_img_path": os.path.abspath(replaced_img_path),
+                "key": key_norm,
+                "notes": [
+                    {
+                        "degree": n.degree,
+                        "accidental": n.accidental,
+                        "octave_offset": n.octave_offset,
+                        "pitch": n.pitch,
+                        "articulation": n.articulation,
+                        "center": n.center,
+                        "w": n.bbox[2],
+                        "h": n.bbox[3],
+                        "row_center_y": n.row_center_y,
+                    }
+                    for n in notes
+                ],
+            }
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"Saved notes info to {out_json}")
+            saved = True
+        break
+    cv2.destroyAllWindows()
+    return out_json, saved
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("用法: python notation_detect.py <matchinfo.json> <key>")
+        return
+    matchinfo_path = sys.argv[1]
+    key = sys.argv[2]
+    _, _ = run_notation_detect(matchinfo_path, key)
+
+
+if __name__ == "__main__":
+    main()
