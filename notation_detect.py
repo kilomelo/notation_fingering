@@ -7,59 +7,20 @@ from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 
-# 调号音阶表
-KEY_SCALES = {
-    "C": ["C", "D", "E", "F", "G", "A", "B"],
-    "G": ["G", "A", "B", "C", "D", "E", "F#"],
-    "D": ["D", "E", "F#", "G", "A", "B", "C#"],
-    "A": ["A", "B", "C#", "D", "E", "F#", "G#"],
-    "E": ["E", "F#", "G#", "A", "B", "C#", "D#"],
-    "B": ["B", "C#", "D#", "E", "F#", "G#", "A#"],
-    "F#": ["F#", "G#", "A#", "B", "C#", "D#", "E#"],
-    "C#": ["C#", "D#", "E#", "F#", "G#", "A#", "B#"],
-    "F": ["F", "G", "A", "Bb", "C", "D", "E"],
-    "Bb": ["Bb", "C", "D", "Eb", "F", "G", "A"],
-    "Eb": ["Eb", "F", "G", "Ab", "Bb", "C", "D"],
-    "Ab": ["Ab", "Bb", "C", "Db", "Eb", "F", "G"],
-    "Db": ["Db", "Eb", "F", "Gb", "Ab", "Bb", "C"],
-    "Gb": ["Gb", "Ab", "Bb", "Cb", "Db", "Eb", "F"],
-    "Cb": ["Cb", "Db", "Eb", "Fb", "Gb", "Ab", "Bb"],
-}
-
-NOTE_TO_SEMI = {
-    "C": 0,
-    "C#": 1,
-    "Db": 1,
-    "D": 2,
-    "D#": 3,
-    "Eb": 3,
-    "E": 4,
-    "Fb": 4,
-    "E#": 5,
-    "F": 5,
-    "F#": 6,
-    "Gb": 6,
-    "G": 7,
-    "G#": 8,
-    "Ab": 8,
-    "A": 9,
-    "A#": 10,
-    "Bb": 10,
-    "B": 11,
-    "Cb": 11,
-}
-
-SEMI_TO_NOTE_SHARP = {0: "C", 1: "C#", 2: "D", 3: "D#", 4: "E", 5: "F", 6: "F#", 7: "G", 8: "G#", 9: "A", 10: "A#", 11: "B"}
-SEMI_TO_NOTE_FLAT = {0: "C", 1: "Db", 2: "D", 3: "Eb", 4: "E", 5: "F", 6: "Gb", 7: "G", 8: "Ab", 9: "A", 10: "Bb", 11: "B"}
+"""
+从 template_match_replace 生成的 matchinfo.json 中解析数字/符号，计算音符属性并可视化预览。
+输出 *_notes.json，字段包含 midi 音高、休止符标记、连音线与行中心等信息，供渲染使用。
+"""
 
 
 @dataclass
 class NoteInfo:
     degree: int
-    accidental: int  # -1 flat, 0 natural, +1 sharp
-    octave_offset: int
-    pitch: str
+    accidental: int | None  # -1 flat, 0 natural, +1 sharp；休止符为 None
+    octave_offset: int | None  # 休止符为 None
+    pitch: int | None  # midi 编号，休止符为 None
     articulation: bool
+    is_rest: bool
     bbox: Tuple[int, int, int, int]
     center: Tuple[float, float]
     row_center_y: float
@@ -79,47 +40,62 @@ class DetectParams:
 
 
 def normalize_key(key: str) -> str:
-    return key if key in KEY_SCALES else "C"
+    return key if key in KEY_BASE_MIDI else "C"
 
 
-def build_base_octaves(scale: List[str]) -> List[int]:
-    base_octaves = []
-    octave = 3
-    prev_letter = scale[0][0]
-    for name in scale:
-        letter = name[0]
-        if base_octaves and prev_letter > letter:
-            octave += 1
-        base_octaves.append(octave)
-        prev_letter = letter
-    return base_octaves
+# 调号 degree 1 基准 midi（无升降号、无八度点）
+KEY_BASE_MIDI = {
+    "C": 72,
+    "G": 67,
+    "D": 62,
+    "A": 69,
+    "E": 64,
+    "B": 71,
+    "F#": 66,
+    "C#": 73,
+    "F": 65,
+    "Bb": 70,
+    "Eb": 63,
+    "Ab": 68,
+    "Db": 73,
+    "Gb": 66,
+    "Cb": 71,
+}
+
+# 半音到升号音名（用于显示）
+SEMI_TO_NOTE_SHARP = {0: "C", 1: "C#", 2: "D", 3: "D#", 4: "E", 5: "F", 6: "F#", 7: "G", 8: "G#", 9: "A", 10: "A#", 11: "B"}
+
+# 度数+升降号相对“1”的半音偏移
+INTERVALS = {
+    "1b": -1,
+    "1": 0,
+    "1#": 1,
+    "2b": 1,
+    "2": 2,
+    "2#": 3,
+    "3b": 3,
+    "3": 4,
+    "4b": 4,
+    "3#": 5,
+    "4": 5,
+    "4#": 6,
+    "5b": 6,
+    "5": 7,
+    "5#": 8,
+    "6b": 8,
+    "6": 9,
+    "6#": 10,
+    "7b": 10,
+    "7": 11,
+    "7#": 12,
+}
 
 
-def name_to_semi(name: str) -> int:
-    return NOTE_TO_SEMI.get(name, 0)
-
-
-def semi_to_name(semi: int, prefer_flat: bool) -> str:
-    semi = semi % 12
-    return SEMI_TO_NOTE_FLAT[semi] if prefer_flat else SEMI_TO_NOTE_SHARP[semi]
-
-
-def degree_to_pitch(scale: List[str], base_octaves: List[int], degree: int, accidental: int, octave_offset: int, prefer_flat: bool) -> str:
-    idx = (degree - 1) % 7
-    base_name = scale[idx]
-    base_oct = base_octaves[idx]
-    semi = name_to_semi(base_name) + accidental
-    # 调整八度跨越
-    add_oct = 0
-    while semi < 0:
-        semi += 12
-        add_oct -= 1
-    while semi >= 12:
-        semi -= 12
-        add_oct += 1
-    octave = base_oct + octave_offset + add_oct
-    name = semi_to_name(semi, prefer_flat)
-    return f"{name}{octave}"
+def midi_to_name(midi: int) -> str:
+    """返回带升号的科学音名（用 #）。"""
+    octave = (midi // 12) - 1
+    semi = midi % 12
+    return f"{SEMI_TO_NOTE_SHARP[semi]}{octave}"
 
 
 def cluster_digits(digits: List[Tuple[int, int, int, int, float]], tol_factor: float = 0.6):
@@ -222,10 +198,6 @@ def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = No
 
     # 构造 NoteInfo
     notes: List[NoteInfo] = []
-    scale = KEY_SCALES[key_norm]
-    base_octaves = build_base_octaves(scale)
-    prefer_flat = "b" in key_norm
-
     # 排序
     main_digit_boxes = []
     for deg, x, y, w, h, s in digit_boxes:
@@ -274,15 +246,26 @@ def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = No
         slur_h = h * params.slur_h_ratio
         slur_box = (int(cx - slur_w / 2), int(y - slur_h), int(slur_w), int(slur_h))
 
-        pitch = degree_to_pitch(scale, base_octaves, deg if deg != 0 else 7, accidental, octave_offset, prefer_flat)
+        # 休止符（0）不计算音高/升降号/八度点
+        is_rest = deg == 0
+        midi_val = None
+        if not is_rest:
+            deg_key = deg
+            acc_key = "#" if accidental == 1 else ("b" if accidental == -1 else "")
+            interval_key = f"{deg_key}{acc_key}"
+            if interval_key not in INTERVALS:
+                continue
+            base_midi = KEY_BASE_MIDI.get(key_norm, 60)
+            midi_val = base_midi + INTERVALS[interval_key] + octave_offset * 12
 
         notes.append(
             NoteInfo(
                 degree=deg,
-                accidental=accidental,
-                octave_offset=octave_offset,
-                pitch=pitch,
+                accidental=None if is_rest else accidental,
+                octave_offset=None if is_rest else octave_offset,
+                pitch=midi_val,
                 articulation=True,  # 先占位，稍后计算
+                is_rest=is_rest,
                 bbox=(x, y, w, h),
                 center=(cx, cy),
                 row_center_y=row_center_y,
@@ -297,6 +280,8 @@ def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = No
     for i, n in enumerate(notes):
         n.slur_start = False
         n.slur_end = False
+        if n.is_rest:
+            continue
         # 使用已有检测结果判断左/右
         slur_box = n.slur_boxes[0]
         for bx, by, bw, bh, _ in slur_left_boxes:
@@ -313,7 +298,10 @@ def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = No
             n.articulation = True
             continue
         prev = notes[i - 1]
-        n.articulation = not (n.pitch == prev.pitch and prev.slur_start and n.slur_end)
+        if n.is_rest:
+            n.articulation = True
+        else:
+            n.articulation = not (n.pitch == prev.pitch and prev.slur_start and n.slur_end)
 
     # 可视化
     colors = [(0, 0, 255), (0, 165, 255), (255, 0, 0), (0, 128, 128), (128, 0, 128)]
@@ -321,11 +309,17 @@ def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = No
     print(f"Row center y: {row_center_y}")
     print(f"Detected {len(notes)} notes:")
     for i, n in enumerate(notes, 1):
-        print(
-            f"{i:2d}. degree={n.degree}, accidental={n.accidental:+d}, octave_offset={n.octave_offset:+d}, "
-            f"pitch={n.pitch}, articulation={'head' if n.articulation else 'tie'}, "
-            f"bbox=({n.bbox[0]},{n.bbox[1]},{n.bbox[2]},{n.bbox[3]}), center=({n.center[0]:.1f},{n.center[1]:.1f})"
-        )
+        if n.is_rest:
+            print(
+                f"{i:2d}. degree={n.degree} (rest), bbox=({n.bbox[0]},{n.bbox[1]},{n.bbox[2]},{n.bbox[3]}), "
+                f"center=({n.center[0]:.1f},{n.center[1]:.1f})"
+            )
+        else:
+            print(
+                f"{i:2d}. degree={n.degree}, accidental={n.accidental:+d}, octave_offset={n.octave_offset:+d}, "
+                f"pitch_midi={n.pitch}, pitch_name={midi_to_name(n.pitch)}, articulation={'head' if n.articulation else 'tie'}, "
+                f"bbox=({n.bbox[0]},{n.bbox[1]},{n.bbox[2]},{n.bbox[3]}), center=({n.center[0]:.1f},{n.center[1]:.1f})"
+            )
     mode = 1  # 0:原图, 1:数字+行线, 2:上下点框, 3:升降号框, 4:延音线框
     saved = False
     out_json = None
@@ -353,8 +347,8 @@ def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = No
             for idx, n in enumerate(notes):
                 color = colors[idx % len(colors)]
                 x, y, w, h = n.bbox
-                # 共用右侧 pitch label
-                pitch_text = n.pitch
+                # 共用右侧 label：休止符显示 rest，其余显示科学音名
+                pitch_text = "rest" if n.is_rest else midi_to_name(n.pitch)
                 cv2.putText(vis, pitch_text, (x + w + 2, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
                 if mode == 1:
                     cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
@@ -363,22 +357,25 @@ def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = No
                         cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), color, 1)
                     for dx, dy in n.dots_hit:
                         cv2.circle(vis, (int(dx), int(dy)), 3, color, -1)
-                    cv2.putText(vis, f"{n.octave_offset:+d}", (x + w + 2, y + h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                    if not n.is_rest:
+                        cv2.putText(vis, f"{n.octave_offset:+d}", (x + w + 2, y + h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
                 elif mode == 3:
                     ax, ay, aw, ah = n.acc_box
                     cv2.rectangle(vis, (ax, ay), (ax + aw, ay + ah), color, 1)
-                    cv2.putText(vis, f"{n.accidental:+d}", (x + w + 2, y + h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                    if not n.is_rest:
+                        cv2.putText(vis, f"{n.accidental:+d}", (x + w + 2, y + h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
                 elif mode == 4:
                     for bx, by, bw, bh in n.slur_boxes:
                         cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), color, 1)
-                    slur_state = "none"
-                    if n.slur_start and n.slur_end:
-                        slur_state = "both"
-                    elif n.slur_start:
-                        slur_state = "left"
-                    elif n.slur_end:
-                        slur_state = "right"
-                    cv2.putText(vis, slur_state, (x + w + 2, y + h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                    if not n.is_rest:
+                        slur_state = "none"
+                        if n.slur_start and n.slur_end:
+                            slur_state = "both"
+                        elif n.slur_start:
+                            slur_state = "left"
+                        elif n.slur_end:
+                            slur_state = "right"
+                        cv2.putText(vis, slur_state, (x + w + 2, y + h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
             show = vis
         cv2.imshow("notation_detect", show)
         key_code = cv2.waitKey(0) & 0xFF
@@ -395,10 +392,8 @@ def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = No
                 "notes": [
                     {
                         "degree": n.degree,
-                        "accidental": n.accidental,
-                        "octave_offset": n.octave_offset,
-                        "pitch": n.pitch,
                         "articulation": n.articulation,
+                        "is_rest": n.is_rest,
                         "center": n.center,
                         "w": n.bbox[2],
                         "h": n.bbox[3],
@@ -407,6 +402,11 @@ def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = No
                     for n in notes
                 ],
             }
+            for obj, n in zip(data["notes"], notes):
+                if not n.is_rest:
+                    obj["accidental"] = n.accidental
+                    obj["octave_offset"] = n.octave_offset
+                    obj["midi"] = n.pitch
             with open(out_json, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             print(f"Saved notes info to {out_json}")

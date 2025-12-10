@@ -6,8 +6,14 @@ import argparse
 from typing import Dict, List, Tuple
 import numpy as np
 
+"""
+将 notation_detect 输出的 *_notes.json 与替换后的乐谱图片进行合成，可叠加指法图（支持多变体点击切换）。
+预览窗口按回车保存最终结果；输出命名为 {源图文件名}_fingering.png。
+"""
+
 # MIDI 计算用：C4 = 60
 NOTE_SEMI = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+SEMI_TO_NOTE_SHARP = {0: "C", 1: "C#", 2: "D", 3: "D#", 4: "E", 5: "F", 6: "F#", 7: "G", 8: "G#", 9: "A", 10: "A#", 11: "B"}
 
 
 def pitch_to_midi(pitch: str) -> int:
@@ -33,26 +39,41 @@ def pitch_to_midi(pitch: str) -> int:
     return (octave + 1) * 12 + semi
 
 
+def midi_to_name(midi: int) -> str:
+    """返回带升号的科学音名（用 #）。"""
+    octave = (midi // 12) - 1
+    semi = midi % 12
+    return f"{SEMI_TO_NOTE_SHARP[semi]}{octave}"
+
+
 def load_notes_json(path: str):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def build_fingering_index(fingering_dir: str) -> Dict[int, str]:
+def build_fingering_index(fingering_dir: str) -> Dict[int, List[Tuple[int, str]]]:
     """
-    扫描指法目录，将文件名中的音高部分（下划线前）映射到 MIDI。文件名示例：G4_0_off.png
-    若有同一 MIDI 多个文件，保留首次扫描到的。
+    扫描指法目录，按 MIDI 归档所有变体。
+    文件名规则：{pitch}_{variant_id}_off.png 例如 G4_0_off.png、G4_1_off.png。
+    返回 midi -> [(variant_id, path)]（按 variant_id 升序）。
     """
-    idx: Dict[int, str] = {}
+    idx: Dict[int, List[Tuple[int, str]]] = {}
+    pat = re.compile(r"^([A-Ga-g][#b]?\d+)_([0-9]+)_off\.png$")
     for name in os.listdir(fingering_dir):
         if not name.lower().endswith(".png"):
             continue
-        pitch_part = name.split("_")[0]
+        m = pat.match(name)
+        if not m:
+            continue
+        pitch_part = m.group(1)
         try:
             midi = pitch_to_midi(pitch_part)
         except ValueError:
             continue
-        idx.setdefault(midi, os.path.join(fingering_dir, name))
+        variant_id = int(m.group(2))
+        idx.setdefault(midi, []).append((variant_id, os.path.join(fingering_dir, name)))
+    for midi in idx:
+        idx[midi].sort(key=lambda t: t[0])
     return idx
 
 
@@ -64,9 +85,11 @@ def export_notation(
     fingering_img_path: str = None,
     fingering_img_offset: Tuple[int, int] = (0, 0),
     fingering_scale: float = 1.0,
-) -> None:
+) -> bool:
     """
-    将乐谱（已替换后的图片）渲染到指定画布，并可叠加指法图。按空格切换模式，回车保存。
+    将乐谱（已替换后的图片）渲染到指定画布，并可叠加指法图。
+    支持在预览窗口点击某个指法图区域循环切换变体（文件名中的 variant_id）。
+    回车保存当前选择下的画面，返回是否已保存。
 
     参数：
         target_resolution: (width, height) 输出图片尺寸。
@@ -146,8 +169,8 @@ def export_notation(
     out = np.concatenate([out_rgb, out_a], axis=2)
     canvas[y1:y2, x1:x2, :] = out
 
-    # 指法图索引
-    fing_index = {}
+    # 指法图索引（midi -> [(variant_id, path)]）
+    fing_index: Dict[int, List[Tuple[int, str]]] = {}
     if fingering_img_path:
         fing_index = build_fingering_index(fingering_img_path)
     fx_off, fy_off = fingering_img_offset
@@ -160,34 +183,69 @@ def export_notation(
         out_rgb = np.where(out_a > 1e-6, out_rgb / out_a, 0)
         return np.concatenate([out_rgb, out_a], axis=2)
 
-    # 渲染指法图（仅音头）
+    # 记录可点击的指法信息：每个音的可用变体及当前选择
+    selections = []
+    img_cache: Dict[str, np.ndarray] = {}
     if fing_index:
-        for n in notes_data:
+        for idx, n in enumerate(notes_data):
             if not n.get("articulation", True):
                 continue
-            pitch = n.get("pitch", "")
-            try:
-                midi = pitch_to_midi(pitch)
-            except ValueError:
-                print(f"Warning: invalid pitch '{pitch}' for fingering lookup")
+            if n.get("is_rest"):
                 continue
-            fing_path = fing_index.get(midi)
-            if fing_path is None:
-                print(f"Warning: fingering image not found for pitch {pitch}")
+            midi = n.get("midi")
+            if midi is None:
+                pitch = n.get("pitch", "")
+                try:
+                    midi = pitch_to_midi(pitch)
+                except ValueError:
+                    print(f"Warning: invalid pitch '{pitch}' for fingering lookup")
+                    continue
+            pitch_name = midi_to_name(midi)
+            variants = fing_index.get(midi, [])
+            if not variants:
+                print(f"Warning: fingering image not found for pitch {pitch_name}")
                 continue
-            img = cv2.imread(fing_path, cv2.IMREAD_UNCHANGED)
+            # 默认选用 variant_id 为 0；若不存在则取最小 variant_id
+            sel_idx = 0
+            for j, (vid, _) in enumerate(variants):
+                if vid == 0:
+                    sel_idx = j
+                    break
+            selections.append({"note_idx": idx, "pitch_name": pitch_name, "midi": midi, "variants": variants, "sel_idx": sel_idx})
+
+    def load_fing(img_path: str) -> np.ndarray:
+        if img_path in img_cache:
+            return img_cache[img_path]
+        img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        if img.shape[2] == 3:
+            alpha_f = np.ones(img.shape[:2], dtype=np.uint8) * 255
+            img = np.dstack([img, alpha_f])
+        img_cache[img_path] = img
+        return img
+
+    def render_with_selection():
+        canvas_cur = canvas.copy()
+        click_boxes = []  # 记录可点击区域及所对应的 selection
+        for sel in selections:
+            n = notes_data[sel["note_idx"]]
+            variants = sel["variants"]
+            if not variants:
+                continue
+            variant_id, fing_path = variants[sel["sel_idx"]]
+            img = load_fing(fing_path)
             if img is None:
                 print(f"Warning: cannot read fingering image: {fing_path}")
                 continue
-            if img.shape[2] == 3:
-                alpha_f = np.ones(img.shape[:2], dtype=np.uint8) * 255
-                img = np.dstack([img, alpha_f])
             if fingering_scale != 1.0:
                 new_w = max(1, int(round(img.shape[1] * fingering_scale)))
                 new_h = max(1, int(round(img.shape[0] * fingering_scale)))
-                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                img_scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                img_scaled = img
 
-            fg_h, fg_w = img.shape[:2]
+            fg_h, fg_w = img_scaled.shape[:2]
             cx_note = x_off + n["center"][0] + fx_off
             top_y = y_off + n["row_center_y"] + fy_off
             tl_x = int(round(cx_note - fg_w / 2))
@@ -207,21 +265,58 @@ def export_notation(
             fg_x2 = fg_x1 + (clip_x2 - clip_x1)
             fg_y2 = fg_y1 + (clip_y2 - clip_y1)
 
-            fg_crop = img[fg_y1:fg_y2, fg_x1:fg_x2, :].astype(np.float32) / 255.0
-            dst_roi = canvas[clip_y1:clip_y2, clip_x1:clip_x2, :]
+            fg_crop = img_scaled[fg_y1:fg_y2, fg_x1:fg_x2, :].astype(np.float32) / 255.0
+            dst_roi = canvas_cur[clip_y1:clip_y2, clip_x1:clip_x2, :]
             blended = blend_alpha(dst_roi, fg_crop)
-            canvas[clip_y1:clip_y2, clip_x1:clip_x2, :] = blended
+            canvas_cur[clip_y1:clip_y2, clip_x1:clip_x2, :] = blended
+            click_boxes.append(
+                {
+                    "bbox": (clip_x1, clip_y1, clip_x2, clip_y2),
+                    "selection": sel,
+                    "variant_id": variant_id,
+                }
+            )
+        return (canvas_cur * 255.0).clip(0, 255).astype(np.uint8), click_boxes
 
-    canvas_uint8 = (canvas * 255.0).clip(0, 255).astype(np.uint8)
+    rendered_img, click_boxes = render_with_selection()
 
+    # 鼠标点击切换变体
+    cv2.namedWindow("export")
+
+    def on_mouse(event, x, y, flags, param):
+        nonlocal rendered_img, click_boxes
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        for info in click_boxes:
+            x1, y1, x2, y2 = info["bbox"]
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                sel = info["selection"]
+                variants = sel["variants"]
+                if not variants:
+                    return
+                if len(variants) == 1:
+                    print("该音高只有一种指法，无法切换")
+                    return
+                sel["sel_idx"] = (sel["sel_idx"] + 1) % len(variants)
+                new_vid = variants[sel["sel_idx"]][0]
+                print(f"指法切换: 音高 {sel['pitch_name']} -> 变体 {new_vid}")
+                rendered_img, click_boxes = render_with_selection()
+                cv2.imshow("export", rendered_img)
+                break
+
+    cv2.setMouseCallback("export", on_mouse)
+
+    saved = False
     while True:
-        cv2.imshow("export", canvas_uint8)
+        cv2.imshow("export", rendered_img)
         key = cv2.waitKey(0) & 0xFF
         if key in (13, 10):
-            cv2.imwrite(target_path, canvas_uint8)
+            cv2.imwrite(target_path, rendered_img)
             print(f"Saved exported image to: {os.path.abspath(target_path)}")
+            saved = True
         break
     cv2.destroyAllWindows()
+    return saved
 
 
 def main():

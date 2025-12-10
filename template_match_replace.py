@@ -378,10 +378,12 @@ def run_template_match_replace(notation_img_path: str, templates_path: str):
         if key in (13, 10):  # enter
             base_dir = os.path.dirname(os.path.abspath(notation_img_path))
             stem = os.path.splitext(os.path.basename(notation_img_path))[0]
-            out_img_path = os.path.join(base_dir, f"{stem}_replaced.png")
+            out_dir = os.path.join(base_dir, stem)
+            os.makedirs(out_dir, exist_ok=True)
+            out_img_path = os.path.join(out_dir, f"{stem}_replaced.png")
             cv2.imwrite(out_img_path, replaced_img)
             print(f"Saved replaced image to {out_img_path}")
-            json_path = os.path.join(base_dir, f"{stem}_matchinfo.json")
+            json_path = os.path.join(out_dir, f"{stem}_matchinfo.json")
             save_match_info(json_path, results_json, replace_boxes, notation_img_path, out_img_path)
             saved = True
         break
