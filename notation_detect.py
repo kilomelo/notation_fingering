@@ -384,11 +384,13 @@ def run_notation_detect(matchinfo_path: str, key: str, params: DetectParams = No
             continue
         if key_code in (13, 10):
             base_dir = os.path.dirname(os.path.abspath(replaced_img_path))
-            stem = os.path.splitext(os.path.basename(info.get("src_img_path", "")))[0]
-            out_json = os.path.join(base_dir, f"{stem}_notes.json")
+            src_path = info.get("src_img_path", "")
+            stem = os.path.splitext(os.path.basename(src_path if src_path else replaced_img_path))[0]
+            out_json = os.path.join(base_dir, f"{stem}_{key_norm}_notes.json")
             data = {
                 "replaced_img_path": os.path.abspath(replaced_img_path),
                 "key": key_norm,
+                "src_img_path": os.path.abspath(src_path) if src_path else os.path.abspath(replaced_img_path),
                 "notes": [
                     {
                         "degree": n.degree,

@@ -108,13 +108,19 @@ def export_notation(
 
     info = load_notes_json(notes_json_path)
     replaced_img_path = info.get("replaced_img_path")
+    src_img_path = info.get("src_img_path", replaced_img_path)
     notes_data = info.get("notes", [])
     if not replaced_img_path or not notes_data:
         raise ValueError("notes_json 缺少 replaced_img_path 或 notes 数据")
-    # 目标文件名取自源图文件名
-    src_dir = os.path.dirname(replaced_img_path)
-    src_stem = os.path.splitext(os.path.basename(replaced_img_path))[0]
-    target_path = os.path.join(src_dir, f"{src_stem}_fingering.png")
+    # 目标文件名取自原图文件名，并包含调号；保存到与原图同名的子目录
+    src_dir = os.path.dirname(src_img_path)
+    stem_dir = os.path.splitext(os.path.basename(src_img_path))[0]
+    save_dir = os.path.join(src_dir, stem_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    src_stem = os.path.splitext(os.path.basename(src_img_path))[0]
+    key = info.get("key", "")
+    suffix = f"_{key}" if key else ""
+    target_path = os.path.join(save_dir, f"{src_stem}{suffix}_fingering.png")
 
     base = cv2.imread(replaced_img_path, cv2.IMREAD_UNCHANGED)
     if base is None:
