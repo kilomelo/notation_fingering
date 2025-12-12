@@ -8,7 +8,10 @@ import numpy as np
 
 """
 将 notation_detect 输出的 *_notes.json 与替换后的乐谱图片进行合成，可叠加指法图（支持多变体点击切换）。
-预览窗口按回车保存最终结果；输出命名为 {源图文件名}_fingering.png。
+预览窗口按回车后，批量输出多张图片：
+  - 0 号图：所有音符指法为 off
+  - 之后每个音头一张：当前音头为 on，其余 off，文件名递增
+输出命名为 {原图名}_{key}_fingering_{id}.png，保存到原图同名子目录。
 """
 
 # MIDI 计算用：C4 = 60
@@ -51,19 +54,23 @@ def load_notes_json(path: str):
         return json.load(f)
 
 
-def build_fingering_index(fingering_dir: str) -> Dict[int, List[Tuple[int, str]]]:
+def build_fingering_index(fingering_dir: str, expected_suffix: str | None = None) -> Dict[int, List[Tuple[int, str]]]:
     """
     扫描指法目录，按 MIDI 归档所有变体。
-    文件名规则：{pitch}_{variant_id}_off.png 例如 G4_0_off.png、G4_1_off.png。
+    文件名规则：{pitch}_{variant_id}_{on/off}.png 例如 G4_0_off.png、G4_1_on.png。
+    expected_suffix 可指定过滤 on/off。
     返回 midi -> [(variant_id, path)]（按 variant_id 升序）。
     """
     idx: Dict[int, List[Tuple[int, str]]] = {}
-    pat = re.compile(r"^([A-Ga-g][#b]?\d+)_([0-9]+)_off\.png$")
+    pat = re.compile(r"^([A-Ga-g][#b]?\d+)_([0-9]+)_(on|off)\.png$")
     for name in os.listdir(fingering_dir):
         if not name.lower().endswith(".png"):
             continue
         m = pat.match(name)
         if not m:
+            continue
+        suffix = m.group(3).lower()
+        if expected_suffix and suffix != expected_suffix:
             continue
         pitch_part = m.group(1)
         try:
@@ -82,7 +89,8 @@ def export_notation(
     source_offset: Tuple[int, int],
     notes_json_path: str,
     bg_path: str = None,
-    fingering_img_path: str = None,
+    fingering_off_dir: str = None,
+    fingering_on_dir: str = None,
     fingering_img_offset: Tuple[int, int] = (0, 0),
     fingering_scale: float = 1.0,
 ) -> bool:
@@ -96,7 +104,8 @@ def export_notation(
         source_offset: (x_offset, y_offset) 源图左上角在输出中的偏移。
         notes_json_path: notation_detect 输出的 *_notes.json 路径。
         bg_path: 背景图片路径；为空则使用不透明白底。
-        fingering_img_path: 指法图目录，为空则不渲染指法图。
+        fingering_off_dir: 指法图目录（off 状态），为 None 则不渲染指法图。
+        fingering_on_dir: 指法图目录（on 状态），为 None 则不渲染 on 状态。
         fingering_img_offset: (x_offset, y_offset)，指法图顶边中点相对音符中心/行的偏移。
         fingering_scale: 指法图缩放系数，默认 1.0。
 
@@ -175,10 +184,13 @@ def export_notation(
     out = np.concatenate([out_rgb, out_a], axis=2)
     canvas[y1:y2, x1:x2, :] = out
 
-    # 指法图索引（midi -> [(variant_id, path)]）
-    fing_index: Dict[int, List[Tuple[int, str]]] = {}
-    if fingering_img_path:
-        fing_index = build_fingering_index(fingering_img_path)
+    # 指法图索引（off/on 分别对应 midi -> [(variant_id, path)]）
+    off_index: Dict[int, List[Tuple[int, str]]] = {}
+    on_index: Dict[int, List[Tuple[int, str]]] = {}
+    if fingering_off_dir:
+        off_index = build_fingering_index(fingering_off_dir, expected_suffix="off")
+    if fingering_on_dir:
+        on_index = build_fingering_index(fingering_on_dir, expected_suffix="on")
     fx_off, fy_off = fingering_img_offset
 
     def blend_alpha(dst: np.ndarray, fg: np.ndarray):
@@ -189,35 +201,47 @@ def export_notation(
         out_rgb = np.where(out_a > 1e-6, out_rgb / out_a, 0)
         return np.concatenate([out_rgb, out_a], axis=2)
 
+    def to_bgr(img: np.ndarray) -> np.ndarray:
+        """将 BGRA/BGR 转为 BGR 便于绘制进度条。"""
+        if img.shape[2] == 4:
+            return img[..., :3].copy()
+        return img.copy()
+
     # 记录可点击的指法信息：每个音的可用变体及当前选择
     selections = []
     img_cache: Dict[str, np.ndarray] = {}
-    if fing_index:
-        for idx, n in enumerate(notes_data):
-            if not n.get("articulation", True):
+    # 变体 ID 取 off/on 的并集；默认选 0，否则最小值
+    for idx, n in enumerate(notes_data):
+        if not n.get("articulation", True):
+            continue
+        if n.get("is_rest"):
+            continue
+        midi = n.get("midi")
+        if midi is None:
+            pitch = n.get("pitch", "")
+            try:
+                midi = pitch_to_midi(pitch)
+            except ValueError:
+                print(f"Warning: invalid pitch '{pitch}' for fingering lookup")
                 continue
-            if n.get("is_rest"):
-                continue
-            midi = n.get("midi")
-            if midi is None:
-                pitch = n.get("pitch", "")
-                try:
-                    midi = pitch_to_midi(pitch)
-                except ValueError:
-                    print(f"Warning: invalid pitch '{pitch}' for fingering lookup")
-                    continue
-            pitch_name = midi_to_name(midi)
-            variants = fing_index.get(midi, [])
-            if not variants:
-                print(f"Warning: fingering image not found for pitch {pitch_name}")
-                continue
-            # 默认选用 variant_id 为 0；若不存在则取最小 variant_id
-            sel_idx = 0
-            for j, (vid, _) in enumerate(variants):
-                if vid == 0:
-                    sel_idx = j
-                    break
-            selections.append({"note_idx": idx, "pitch_name": pitch_name, "midi": midi, "variants": variants, "sel_idx": sel_idx})
+        pitch_name = midi_to_name(midi)
+        variants_set = set()
+        for lst in (off_index.get(midi, []), on_index.get(midi, [])):
+            variants_set.update([vid for vid, _ in lst])
+        variants_ids = sorted(list(variants_set))
+        if not variants_ids:
+            print(f"Warning: fingering image not found for pitch {pitch_name}")
+            continue
+        sel_variant_id = 0 if 0 in variants_ids else variants_ids[0]
+        selections.append(
+            {
+                "note_idx": idx,
+                "pitch_name": pitch_name,
+                "midi": midi,
+                "variants": variants_ids,
+                "sel_variant_id": sel_variant_id,
+            }
+        )
 
     def load_fing(img_path: str) -> np.ndarray:
         if img_path in img_cache:
@@ -231,18 +255,59 @@ def export_notation(
         img_cache[img_path] = img
         return img
 
-    def render_with_selection():
+    def find_variant(idx: Dict[int, List[Tuple[int, str]]], midi: int, vid: int):
+        for v_id, path in idx.get(midi, []):
+            if v_id == vid:
+                return path
+        return None
+
+    def resolve_path(midi: int, vid: int, use_on: bool):
+        """
+        返回 (path, used_on_flag)。优先按 use_on 查找 on/off，对应缺失时按规则 fallback。
+        规则：
+          - off 缺失而 on 存在：用 on，输出错误信息。
+          - on 缺失：若 off 存在则用 off 并 warning；都缺失则返回 None。
+        """
+        if use_on:
+            path_on = find_variant(on_index, midi, vid)
+            if path_on:
+                return path_on, True
+            path_off = find_variant(off_index, midi, vid)
+            if path_off:
+                expected = os.path.join(os.path.abspath(fingering_on_dir or ""), f"{midi_to_name(midi)}_{vid}_on.png")
+                print(f"Warning: on 指法缺失，使用 off 代替 (midi={midi}, variant={vid}), 缺失的图片: {expected}")
+                return path_off, False
+            return None, False
+        else:
+            path_off = find_variant(off_index, midi, vid)
+            if path_off:
+                return path_off, False
+            path_on = find_variant(on_index, midi, vid)
+            if path_on:
+                expected = os.path.join(os.path.abspath(fingering_off_dir or ""), f"{midi_to_name(midi)}_{vid}_off.png")
+                print(f"错误: off 指法缺失，使用 on 代替 (midi={midi}, variant={vid}), 缺失的图片: {expected}")
+                return path_on, True
+            return None, False
+
+    def render_with_selection(on_note_idx: int | None):
+        """
+        渲染一张图：
+          - on_note_idx 指定的音（note_idx）使用 on 图片，其余使用 off。
+          - 只有存在指法图的音符才会叠加。
+        返回 (uint8 BGR 或 BGRA, click_boxes)
+        """
         canvas_cur = canvas.copy()
         click_boxes = []  # 记录可点击区域及所对应的 selection
         for sel in selections:
             n = notes_data[sel["note_idx"]]
-            variants = sel["variants"]
-            if not variants:
+            use_on = on_note_idx is not None and sel["note_idx"] == on_note_idx
+            vid = sel["sel_variant_id"]
+            path, used_on = resolve_path(sel["midi"], vid, use_on)
+            if not path:
                 continue
-            variant_id, fing_path = variants[sel["sel_idx"]]
-            img = load_fing(fing_path)
+            img = load_fing(path)
             if img is None:
-                print(f"Warning: cannot read fingering image: {fing_path}")
+                print(f"Warning: cannot read fingering image: {path}")
                 continue
             if fingering_scale != 1.0:
                 new_w = max(1, int(round(img.shape[1] * fingering_scale)))
@@ -279,18 +344,38 @@ def export_notation(
                 {
                     "bbox": (clip_x1, clip_y1, clip_x2, clip_y2),
                     "selection": sel,
-                    "variant_id": variant_id,
+                    "variant_id": vid,
+                    "used_on": used_on,
                 }
             )
         return (canvas_cur * 255.0).clip(0, 255).astype(np.uint8), click_boxes
 
-    rendered_img, click_boxes = render_with_selection()
+    # 预览顺序：0 号 + 按音头顺序的 on 版（懒渲染）
+    head_indices = [
+        (n["center"][0], idx)
+        for idx, n in enumerate(notes_data)
+        if n.get("articulation", True) and not n.get("is_rest")
+    ]
+    head_indices.sort(key=lambda t: t[0])
+    preview_order = [(0, None)] + [(i + 1, note_idx) for i, (_, note_idx) in enumerate(head_indices)]
+    rendered_cache: Dict[int, Tuple[np.ndarray, List[Dict]]] = {}
 
-    # 鼠标点击切换变体
+    def get_preview(idx: int) -> Tuple[np.ndarray, List[Dict]]:
+        if idx in rendered_cache:
+            return rendered_cache[idx]
+        _, note_idx = preview_order[idx]
+        img, boxes = render_with_selection(on_note_idx=note_idx)
+        rendered_cache[idx] = (img, boxes)
+        return img, boxes
+
+    current_idx = 0
+    rendered_img, click_boxes = get_preview(current_idx)
+
+    # 鼠标点击切换变体（更新选择并清空缓存以重新渲染）
     cv2.namedWindow("export")
 
     def on_mouse(event, x, y, flags, param):
-        nonlocal rendered_img, click_boxes
+        nonlocal rendered_img, click_boxes, rendered_cache, current_idx
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         for info in click_boxes:
@@ -303,11 +388,13 @@ def export_notation(
                 if len(variants) == 1:
                     print("该音高只有一种指法，无法切换")
                     return
-                sel["sel_idx"] = (sel["sel_idx"] + 1) % len(variants)
-                new_vid = variants[sel["sel_idx"]][0]
-                print(f"指法切换: 音高 {sel['pitch_name']} -> 变体 {new_vid}")
-                rendered_img, click_boxes = render_with_selection()
+                cur_idx = variants.index(sel["sel_variant_id"])
+                next_id = variants[(cur_idx + 1) % len(variants)]
+                sel["sel_variant_id"] = next_id
+                rendered_cache.clear()  # 变体变更，清空缓存以重算
+                rendered_img, click_boxes = get_preview(current_idx)
                 cv2.imshow("export", rendered_img)
+                print(f"指法切换: 音高 {sel['pitch_name']} -> 变体 {next_id}")
                 break
 
     cv2.setMouseCallback("export", on_mouse)
@@ -316,9 +403,36 @@ def export_notation(
     while True:
         cv2.imshow("export", rendered_img)
         key = cv2.waitKey(0) & 0xFF
+        if key == 32:  # space: 轮播预览
+            current_idx = (current_idx + 1) % len(preview_order)
+            rendered_img, click_boxes = get_preview(current_idx)
+            cv2.imshow("export", rendered_img)
+            continue
         if key in (13, 10):
-            cv2.imwrite(target_path, rendered_img)
-            print(f"Saved exported image to: {os.path.abspath(target_path)}")
+            # 始终输出整套图片
+            img0, _ = get_preview(0)
+            path0 = target_path.replace("_fingering.png", "_fingering_0.png")
+            cv2.imwrite(path0, img0)
+            total = len(preview_order)
+            print(f"开始保存指法序列，共 {total} 张 ...")
+            print(f"[1/{total}] 保存 {os.path.abspath(path0)}")
+            for idx_save, (out_id, _) in enumerate(preview_order[1:], start=2):
+                img, _ = get_preview(out_id)
+                out_path = target_path.replace("_fingering.png", f"_fingering_{out_id}.png")
+                cv2.imwrite(out_path, img)
+                # 进度条绘制
+                progress = idx_save / total
+                bar_img = to_bgr(img)
+                bar_w = int(bar_img.shape[1] * 0.5)
+                bar_h = 20
+                x0 = (bar_img.shape[1] - bar_w) // 2
+                y0 = bar_img.shape[0] - bar_h - 10
+                cv2.rectangle(bar_img, (x0, y0), (x0 + bar_w, y0 + bar_h), (50, 50, 50), 1)
+                cv2.rectangle(bar_img, (x0 + 1, y0 + 1), (x0 + 1 + int((bar_w - 2) * progress), y0 + bar_h - 2), (0, 200, 0), -1)
+                cv2.putText(bar_img, f"{int(progress * 100)}%", (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 1, cv2.LINE_AA)
+                cv2.imshow("export", bar_img)
+                cv2.waitKey(1)
+                print(f"[{idx_save}/{total}] 保存 {os.path.abspath(out_path)}")
             saved = True
         break
     cv2.destroyAllWindows()
@@ -335,7 +449,8 @@ def main():
     parser.add_argument("--offset-x", type=int, default=0, help="Source image offset X in output.")
     parser.add_argument("--offset-y", type=int, default=0, help="Source image offset Y in output.")
     parser.add_argument("--bg", dest="bg_path", help="Background image path; default white.")
-    parser.add_argument("--fingering-dir", dest="fingering_img_path", help="Directory of fingering images.")
+    parser.add_argument("--fingering-off-dir", dest="fingering_off_dir", required=True, help="Directory of fingering off-state images.")
+    parser.add_argument("--fingering-on-dir", dest="fingering_on_dir", required=True, help="Directory of fingering on-state images.")
     parser.add_argument("--fingering-offset-x", type=int, default=0, help="Fingering top-center X offset vs note center.")
     parser.add_argument("--fingering-offset-y", type=int, default=0, help="Fingering top-center Y offset vs row center.")
     parser.add_argument("--fingering-scale", type=float, default=1.0, help="Fingering image scale factor.")
@@ -357,7 +472,8 @@ def main():
         source_offset=(args.offset_x, args.offset_y),
         notes_json_path=args.notes_json_path,
         bg_path=args.bg_path,
-        fingering_img_path=args.fingering_img_path,
+        fingering_off_dir=args.fingering_off_dir,
+        fingering_on_dir=args.fingering_on_dir,
         fingering_img_offset=(args.fingering_offset_x, args.fingering_offset_y),
         fingering_scale=args.fingering_scale,
     )
