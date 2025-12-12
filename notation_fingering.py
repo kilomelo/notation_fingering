@@ -41,6 +41,7 @@ def load_config(path: str):
     bg_path = section.get("bg_path", "")
     fingering_img_offset = tup_int(section.get("fingering_img_offset", "0,0"))
     fingering_scale = section.getfloat("fingering_scale", fallback=1.0)
+    note_indicator_img = section.get("note_indicator_img", "")
 
     return {
         "templates_path": templates_path,
@@ -51,6 +52,7 @@ def load_config(path: str):
         "bg_path": bg_path,
         "fingering_img_offset": fingering_img_offset,
         "fingering_scale": fingering_scale,
+        "note_indicator_img": note_indicator_img,
     }
 
 
@@ -75,6 +77,7 @@ def main():
     bg_path = cfg["bg_path"]
     fingering_img_offset = cfg["fingering_img_offset"]
     fingering_scale = cfg["fingering_scale"]
+    note_indicator_img = cfg["note_indicator_img"]
     audio_path = args.audio_path
 
     # 1) 模板匹配与替换
@@ -99,6 +102,7 @@ def main():
         fingering_on_dir=fingering_on_dir,
         fingering_img_offset=fingering_img_offset,
         fingering_scale=fingering_scale,
+        note_indicator_img=note_indicator_img if note_indicator_img else None,
     )
     if not saved_render:
         print("notation_rendering 未保存结果，流程结束。")

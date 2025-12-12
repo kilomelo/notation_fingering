@@ -93,6 +93,7 @@ def export_notation(
     fingering_on_dir: str = None,
     fingering_img_offset: Tuple[int, int] = (0, 0),
     fingering_scale: float = 1.0,
+    note_indicator_img: str | None = None,
 ) -> bool:
     """
     将乐谱（已替换后的图片）渲染到指定画布，并可叠加指法图。
@@ -154,6 +155,19 @@ def export_notation(
         canvas_rgb = np.ones((height, width, 3), dtype=np.float32)
         canvas_a = np.ones((height, width, 1), dtype=np.float32)
     canvas = np.concatenate([canvas_rgb, canvas_a], axis=2)
+    pre_base_canvas = canvas.copy()  # 背景层（未叠加乐谱）
+    pre_base_canvas = canvas.copy()  # 背景层（未叠加乐谱）
+
+    # 指示框图片（可选，BGRA）
+    indicator_img = None
+    if note_indicator_img:
+        indicator_img = cv2.imread(note_indicator_img, cv2.IMREAD_UNCHANGED)
+        if indicator_img is None:
+            print(f"Warning: 无法读取指示框图片 {note_indicator_img}，忽略指示框。")
+        else:
+            if indicator_img.shape[2] == 3:
+                alpha_f = np.ones(indicator_img.shape[:2], dtype=np.uint8) * 255
+                indicator_img = np.dstack([indicator_img, alpha_f])
 
     # 源图（已替换后）
     if base.shape[2] == 3:
@@ -175,14 +189,18 @@ def export_notation(
     src_y1 = y1 - y_off
     src_crop = base_bgra[src_y1:src_y1 + (y2 - y1), src_x1:src_x1 + (x2 - x1), :]
 
-    dst_roi = canvas[y1:y2, x1:x2, :]
     src_roi = src_crop.astype(np.float32) / 255.0
-    dst_rgb, dst_a = dst_roi[..., :3], dst_roi[..., 3:4]
     src_rgb, src_a = src_roi[..., :3], src_roi[..., 3:4]
-    out_a = 1.0 - (1.0 - dst_a) * (1.0 - src_a)
-    out_rgb = dst_rgb * src_rgb
-    out = np.concatenate([out_rgb, out_a], axis=2)
-    canvas[y1:y2, x1:x2, :] = out
+    def apply_base(dst_canvas: np.ndarray):
+        dst_roi = dst_canvas[y1:y2, x1:x2, :]
+        dst_rgb, dst_a = dst_roi[..., :3], dst_roi[..., 3:4]
+        out_a = 1.0 - (1.0 - dst_a) * (1.0 - src_a)
+        out_rgb = dst_rgb * src_rgb
+        out = np.concatenate([out_rgb, out_a], axis=2)
+        dst_canvas[y1:y2, x1:x2, :] = out
+
+    apply_base(canvas)
+    base_canvas = canvas.copy()  # 背景+乐谱
 
     # 指法图索引（off/on 分别对应 midi -> [(variant_id, path)]）
     off_index: Dict[int, List[Tuple[int, str]]] = {}
@@ -296,7 +314,34 @@ def export_notation(
           - 只有存在指法图的音符才会叠加。
         返回 (uint8 BGR 或 BGRA, click_boxes)
         """
-        canvas_cur = canvas.copy()
+        # 先确定底图：默认为背景+乐谱；若有指示图片且为非 0 号帧，则指示叠加在背景上，再叠加乐谱
+        if on_note_idx is not None and indicator_img is not None:
+            base_with_indicator = pre_base_canvas.copy()
+            n = notes_data[on_note_idx]
+            cx = x_off + n["center"][0]
+            cy = y_off + n["center"][1]
+            ih, iw = indicator_img.shape[:2]
+            tl_x = int(round(cx - iw / 2))
+            tl_y = int(round(cy - ih / 2))
+            br_x = tl_x + iw
+            br_y = tl_y + ih
+            clip_x1 = max(0, tl_x)
+            clip_y1 = max(0, tl_y)
+            clip_x2 = min(width, br_x)
+            clip_y2 = min(height, br_y)
+            if clip_x1 < clip_x2 and clip_y1 < clip_y2:
+                fg_x1 = clip_x1 - tl_x
+                fg_y1 = clip_y1 - tl_y
+                fg_x2 = fg_x1 + (clip_x2 - clip_x1)
+                fg_y2 = fg_y1 + (clip_y2 - clip_y1)
+                fg_crop = indicator_img[fg_y1:fg_y2, fg_x1:fg_x2, :].astype(np.float32) / 255.0
+                dst_roi = base_with_indicator[clip_y1:clip_y2, clip_x1:clip_x2, :]
+                blended = blend_alpha(dst_roi, fg_crop)
+                base_with_indicator[clip_y1:clip_y2, clip_x1:clip_x2, :] = blended
+            apply_base(base_with_indicator)
+            canvas_cur = base_with_indicator
+        else:
+            canvas_cur = base_canvas.copy()
         click_boxes = []  # 记录可点击区域及所对应的 selection
         for sel in selections:
             n = notes_data[sel["note_idx"]]
@@ -454,6 +499,7 @@ def main():
     parser.add_argument("--fingering-offset-x", type=int, default=0, help="Fingering top-center X offset vs note center.")
     parser.add_argument("--fingering-offset-y", type=int, default=0, help="Fingering top-center Y offset vs row center.")
     parser.add_argument("--fingering-scale", type=float, default=1.0, help="Fingering image scale factor.")
+    parser.add_argument("--note-indicator-img", type=str, help="Path to note indicator image (with alpha).")
     args = parser.parse_args()
 
     # 如果未指定输出尺寸，则沿用源图尺寸
@@ -476,6 +522,7 @@ def main():
         fingering_on_dir=args.fingering_on_dir,
         fingering_img_offset=(args.fingering_offset_x, args.fingering_offset_y),
         fingering_scale=args.fingering_scale,
+        note_indicator_img=args.note_indicator_img,
     )
 
 
