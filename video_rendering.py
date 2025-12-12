@@ -423,6 +423,7 @@ def main():
     preview_idx = 0
     play_start_time = None
     play_real_start = None
+    play_offset_sec = 0.0
     timestamps, loaded_start, loaded_end = load_timestamps(ts_json_path, len(frames))
     if loaded_end > 0:
         segment_start_ms = loaded_start
@@ -441,11 +442,14 @@ def main():
         return frames[idx]
 
     # 音频播放控制：使用 ffplay 子进程，稳定且可终止
-    def start_audio_playback():
+    def start_audio_playback(offset_sec: float = 0.0):
         global audio_proc
         stop_audio_playback()
         try:
-            dur_sec = max(0, (segment_end_ms - segment_start_ms) / 1000.0)
+            total_sec = max(0.0, (segment_end_ms - segment_start_ms) / 1000.0)
+            offset_sec = max(0.0, offset_sec)
+            start_ss = segment_start_ms / 1000.0 + offset_sec
+            dur_sec = max(0.0, total_sec - offset_sec)
             audio_proc = subprocess.Popen(
                 [
                     "ffplay",
@@ -454,7 +458,7 @@ def main():
                     "-loglevel",
                     "quiet",
                     "-ss",
-                    str(segment_start_ms / 1000.0),
+                    str(start_ss),
                     "-t",
                     str(dur_sec),
                     "-i",
@@ -583,8 +587,9 @@ def main():
                 mode = "play"
                 current_play_time = 0.0
                 play_real_start = time.time()
+                play_offset_sec = 0.0
                 active_btn = None
-                start_audio_playback()
+                start_audio_playback(offset_sec=play_offset_sec)
                 play_ts = [t if t is not None else segment_end_ms for t in timestamps]
             # 鼠標事件設置在 window callback
             # 按 e 導出
@@ -613,7 +618,7 @@ def main():
                 mode = "mark"
                 continue
             if play_real_start is not None:
-                current_play_time = time.time() - play_real_start
+                current_play_time = play_offset_sec + (time.time() - play_real_start)
                 # print(f"[play] t_now={t_now:.3f}s / {duration:.3f}s")
                 if current_play_time >= duration:
                     stop_audio_playback()
@@ -636,7 +641,7 @@ def main():
             return rx <= px <= rx + rw and ry <= py <= ry + rh
 
         def on_mouse(event, x, y, flags, param):
-            nonlocal active_btn, timestamps, preview_idx, mode, play_real_start, current_play_time, play_ts
+            nonlocal active_btn, timestamps, preview_idx, mode, play_real_start, current_play_time, play_ts, play_offset_sec
             nonlocal segment_start_ms, segment_end_ms, wave_data_segment, duration, drag_active, drag_start_x, drag_cur_x
 
             # 若正在拖拽且鼠标已离开全波形区域，则立即取消
@@ -715,9 +720,10 @@ def main():
                         mode = "play"
                         current_play_time = 0
                         play_real_start = time.time()
+                        play_offset_sec = 0.0
                         active_btn = None
                         play_ts = [t if t is not None else segment_end_ms for t in timestamps]
-                        start_audio_playback()
+                        start_audio_playback(offset_sec=play_offset_sec)
                         return
                     elif in_rect(x, y_rel, stop_rect) and mode == "play":
                         stop_audio_playback()
@@ -776,7 +782,19 @@ def main():
                     return
                 # 點擊波形區設置時間（仅标记按钮上沿以上区域）
                 if 0 <= y_rel < btn_y_rel:
-                    set_time_from_x()
+                    if mode == "mark":
+                        set_time_from_x()
+                    else:
+                        # 播放模式下，点击波形跳转
+                        span_ms = max(1, segment_end_ms - segment_start_ms)
+                        target_ms = int(segment_start_ms + (x / w) * span_ms)
+                        target_ms = max(segment_start_ms, min(segment_end_ms - 1, target_ms))
+                        target_sec = (target_ms - segment_start_ms) / 1000.0
+                        play_offset_sec = target_sec
+                        current_play_time = target_sec
+                        play_real_start = time.time()
+                        play_ts = [t if t is not None else segment_end_ms for t in timestamps]
+                        start_audio_playback(offset_sec=play_offset_sec)
             elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
                 # 拖动时忽略按钮/控制区
                 if y_rel >= btn_y_rel:
